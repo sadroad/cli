@@ -54,6 +54,14 @@ pub struct Args {
     /// Show full change details.
     #[clap(long, alias = "full")]
     pub(super) verbose: bool,
+
+    /// Exit 2 when a plan has pending changes, 0 when none (plan only). For CI gating.
+    #[clap(long)]
+    pub(super) detailed_exit_code: bool,
+
+    /// Print variable values in the plan instead of redacting them.
+    #[clap(long)]
+    pub(super) show_values: bool,
 }
 
 #[derive(Deserialize, serde::Serialize)]
@@ -78,6 +86,7 @@ pub(super) struct RunnerResponse {
 #[serde(rename_all = "camelCase")]
 struct CurrentEnvironment {
     project_id: Option<String>,
+    project_name: Option<String>,
     environment_id: String,
     environment_name: Option<String>,
 }
@@ -247,6 +256,7 @@ pub(super) async fn run_command(args: Args) -> Result<()> {
         if !output.ok {
             bail!(runner_diagnostics_message(&output));
         }
+        maybe_detailed_exit(&args, command, &output);
         return Ok(());
     }
 
@@ -255,7 +265,27 @@ pub(super) async fn run_command(args: Args) -> Result<()> {
         bail!(runner_diagnostics_message(&output));
     }
 
+    maybe_detailed_exit(&args, command, &output);
+
     Ok(())
+}
+
+/// Terraform-style `-detailed-exitcode`: on a successful `plan`, exit 2 if changes
+/// are pending (0 if none). Opt-in via --detailed-exit-code, so default behavior is
+/// unchanged and existing CI keeps working. Errors still surface as a non-zero
+/// failure through the normal path; this only distinguishes no-changes from changes.
+fn maybe_detailed_exit(args: &Args, command: &str, output: &RunnerResponse) {
+    if !args.detailed_exit_code || command != "plan" || !output.ok {
+        return;
+    }
+    let pending = output
+        .change_set
+        .as_ref()
+        .map(|change_set| !change_set.changes.is_empty())
+        .unwrap_or(false);
+    if pending {
+        std::process::exit(2);
+    }
 }
 
 async fn preview_before_apply(
@@ -364,6 +394,7 @@ async fn invoke_runner(
         "file": args.file.as_ref().map(|path| path.to_string_lossy().to_string()),
         "includeTypes": args.include_types,
         "pretty": false,
+        "revealValues": args.show_values,
         "context": {
             "projectId": linked_project.project,
             "projectName": linked_project.name,
@@ -495,6 +526,26 @@ fn runner_cwd(runner: &str) -> Option<PathBuf> {
     dist_dir.parent().map(|path| path.to_path_buf())
 }
 
+/// Terraform-style one-line summary printed atop the change list.
+fn plan_summary_line(changes: &[Change]) -> String {
+    let (mut add, mut change, mut destroy) = (0usize, 0usize, 0usize);
+    for entry in changes {
+        match entry.kind.as_deref() {
+            Some("resource.create") | Some("domain.create") => add += 1,
+            Some("resource.delete") | Some("variable.delete") => destroy += 1,
+            // resource.update, variable.set, and anything else count as a change.
+            _ => change += 1,
+        }
+    }
+    format!(
+        "{} {}, {}, {}",
+        "Plan:".bold(),
+        format!("{add} to add").green(),
+        format!("{change} to change").yellow(),
+        format!("{destroy} to destroy").red(),
+    )
+}
+
 fn has_destructive_changes(response: &RunnerResponse) -> bool {
     response
         .change_set
@@ -565,6 +616,13 @@ pub(super) fn print_response_with_options_and_next(
     );
 
     if let Some(environment) = &response.current_environment {
+        if let Some(project_name) = environment
+            .project_name
+            .as_deref()
+            .or(environment.project_id.as_deref())
+        {
+            println!("{} {}", "Project".dimmed(), project_name.cyan());
+        }
         let environment_name = environment
             .environment_name
             .as_deref()
@@ -572,7 +630,7 @@ pub(super) fn print_response_with_options_and_next(
         println!("{} {}", "Environment".dimmed(), environment_name.cyan());
         if verbose {
             if let Some(project_id) = &environment.project_id {
-                println!("{} {}", "Project".dimmed(), project_id.dimmed());
+                println!("{} {}", "Project ID".dimmed(), project_id.dimmed());
             }
         }
     }
@@ -633,8 +691,7 @@ pub(super) fn print_response_with_options_and_next(
             "✓ Your Railway configuration is already up to date.".green()
         );
     } else {
-        let total = changes.len();
-        println!("{} {}", "Changes".bold(), format!("({total})").dimmed());
+        println!("{}", plan_summary_line(changes));
         for change in changes {
             print_change(change, verbose);
         }

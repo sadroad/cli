@@ -35,6 +35,7 @@ commands!(
     agent,
     autoupdate,
     bucket,
+    cdn,
     completion,
     config,
     connect,
@@ -56,6 +57,7 @@ commands!(
     metrics,
     open,
     project,
+    private_network as "private-network",
     run(local),
     sandbox(sandboxes, sbx),
     service,
@@ -72,6 +74,7 @@ commands!(
     up,
     upgrade,
     variable(variables, vars, var),
+    waf,
     whoami,
     volume,
     redeploy,
@@ -549,6 +552,8 @@ mod cli_tests {
             assert_subcommand(&["link"], "link");
             assert_subcommand(&["up"], "up");
             assert_subcommand(&["redeploy"], "redeploy");
+            assert_subcommand(&["cdn", "status"], "cdn");
+            assert_subcommand(&["waf", "under-attack", "status"], "waf");
             assert_subcommand(&["tcp-proxy", "list"], "tcp-proxy");
         }
 
@@ -743,6 +748,71 @@ mod cli_tests {
             assert_parses(&["tcp-proxy", "create", "--port", "5432"]);
             assert_parses(&["tcp-proxy", "status", "proxy-id"]);
             assert_parses(&["tcp-proxy", "delete", "proxy-id", "--yes"]);
+        }
+
+        #[test]
+        fn cdn_subcommands() {
+            assert!(parse(&["cdn"]).is_err());
+            assert_parses(&["cdn", "status"]);
+            assert_parses(&["cdn", "status", "--service", "api", "--json"]);
+            assert_parses(&["cdn", "enable", "--environment", "production"]);
+            assert_parses(&["cdn", "disable", "--service", "web"]);
+            assert_parses(&[
+                "cdn",
+                "update",
+                "--html-caching",
+                "force",
+                "--default-ttl",
+                "4h",
+                "--no-swr",
+                "--purge-on-deploy",
+                "all",
+            ]);
+            assert!(parse(&["cdn", "update"]).is_err());
+            assert!(parse(&["cdn", "update", "--swr", "--no-swr"]).is_err());
+            assert!(parse(&["cdn", "update", "--default-ttl", "3h"]).is_err());
+            assert_parses(&["cdn", "purge", "html"]);
+            assert_parses(&["cdn", "purge", "all", "--json"]);
+            assert!(parse(&["cdn", "purge", "--scope", "html"]).is_err());
+        }
+
+        #[test]
+        fn waf_subcommands() {
+            assert!(parse(&["waf"]).is_err());
+            assert!(parse(&["waf", "under-attack"]).is_err());
+            assert_parses(&["waf", "under-attack", "status"]);
+            assert_parses(&[
+                "waf",
+                "under-attack",
+                "status",
+                "--service",
+                "api",
+                "--json",
+            ]);
+            assert_parses(&["waf", "under-attack", "enable"]);
+            assert_parses(&["waf", "under-attack", "enable", "--duration", "forever"]);
+            assert_parses(&["waf", "under-attack", "enable", "--duration", "1h"]);
+            assert_parses(&["waf", "under-attack", "enable", "--duration", "3h"]);
+            assert_parses(&["waf", "under-attack", "enable", "--duration", "12h"]);
+            assert_parses(&["waf", "under-attack", "enable", "--duration", "24h"]);
+            assert_parses(&["waf", "under-attack", "disable", "--service", "web"]);
+            assert!(parse(&["waf", "under-attack", "enable", "--duration", "2h"]).is_err());
+        }
+
+        #[test]
+        fn private_network_subcommands() {
+            assert!(parse(&["private-network"]).is_err());
+            assert_parses(&["private-network", "status"]);
+            assert_parses(&["private-network", "status", "--service", "api", "--json"]);
+            assert_parses(&["private-network", "status", "--network", "railway"]);
+            assert_parses(&["private-network", "update", "api-internal"]);
+            assert_parses(&[
+                "private-network",
+                "update",
+                "api-internal",
+                "--network",
+                "railway",
+            ]);
         }
 
         #[test]
