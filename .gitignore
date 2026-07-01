@@ -6,3 +6,4 @@ bin/railway
 .env
 .DS_Store
 test
+result
