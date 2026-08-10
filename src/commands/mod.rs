@@ -9,9 +9,12 @@ pub fn get_dynamic_args(cmd: clap::Command) -> clap::Command {
 }
 
 pub mod add;
+pub mod api;
 pub mod autoupdate;
 pub mod bucket;
 pub mod cdn;
+pub mod cloud_agent;
+pub mod code;
 pub mod completion;
 pub mod config;
 pub mod connect;
@@ -36,6 +39,7 @@ pub mod metrics;
 pub mod open;
 pub mod outbound_networking;
 mod output;
+pub mod postgres;
 pub mod private_network;
 pub mod project;
 pub mod redeploy;

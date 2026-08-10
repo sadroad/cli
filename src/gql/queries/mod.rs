@@ -116,6 +116,14 @@ pub struct NetworkFlowLogs;
 #[derive(GraphQLQuery)]
 #[graphql(
     schema_path = "src/gql/schema.json",
+    query_path = "src/gql/queries/strings/DnsQueryLogs.graphql",
+    response_derives = "Debug, Serialize, Clone"
+)]
+pub struct DnsQueryLogs;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.json",
     query_path = "src/gql/queries/strings/Domains.graphql",
     response_derives = "Debug, Serialize, Clone"
 )]
@@ -330,6 +338,42 @@ pub struct SshPublicKeys;
 #[derive(GraphQLQuery)]
 #[graphql(
     schema_path = "src/gql/schema.json",
+    query_path = "src/gql/queries/strings/CloudAgent.graphql",
+    response_derives = "Debug, Serialize, Clone, PartialEq",
+    skip_serializing_none
+)]
+pub struct CloudAgent;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.json",
+    query_path = "src/gql/queries/strings/CloudAgents.graphql",
+    response_derives = "Debug, Serialize, Clone, PartialEq",
+    skip_serializing_none
+)]
+pub struct CloudAgents;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.json",
+    query_path = "src/gql/queries/strings/MyCloudAgents.graphql",
+    response_derives = "Debug, Serialize, Clone, PartialEq",
+    skip_serializing_none
+)]
+pub struct MyCloudAgents;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.json",
+    query_path = "src/gql/queries/strings/CloudAgentConsoleSessions.graphql",
+    response_derives = "Debug, Serialize, Clone, PartialEq",
+    skip_serializing_none
+)]
+pub struct CloudAgentConsoleSessions;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.json",
     query_path = "src/gql/queries/strings/Sandbox.graphql",
     response_derives = "Debug, Serialize, Clone",
     skip_serializing_none
@@ -433,3 +477,40 @@ impl From<environment_instances::DeploymentStatus> for SubscriptionDeploymentSta
         }
     }
 }
+
+/// Used by `railway postgres pitr progress`.
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.json",
+    query_path = "src/gql/queries/strings/GetPitrHaWorkflowProgress.graphql",
+    response_derives = "Debug, Serialize, Clone"
+)]
+pub struct GetPitrHaWorkflowProgress;
+
+/// Used by `railway postgres pitr disable`'s HA precheck.
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.json",
+    query_path = "src/gql/queries/strings/GetPitrHaClusterReplicationHealth.graphql",
+    response_derives = "Debug, Serialize, Clone"
+)]
+pub struct GetPitrHaClusterReplicationHealth;
+
+/// Used by `railway postgres pitr backup list`.
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.json",
+    query_path = "src/gql/queries/strings/VolumeInstanceBackupList.graphql",
+    response_derives = "Debug, Serialize, Clone"
+)]
+pub struct VolumeInstanceBackupList;
+
+/// Used by `railway postgres pitr schedule list` and `backup trigger`
+/// (to resolve a schedule id when `--schedule-id` is omitted).
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.json",
+    query_path = "src/gql/queries/strings/VolumeInstanceBackupScheduleList.graphql",
+    response_derives = "Debug, Serialize, Clone"
+)]
+pub struct VolumeInstanceBackupScheduleList;

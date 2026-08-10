@@ -43,6 +43,54 @@ pub struct ServiceInstance {
     pub is_deleted: Option<bool>,
     pub is_created: Option<bool>,
     pub parent_service_id: Option<String>,
+    /// Cluster membership role stamped by template conversion/scaling:
+    /// "root" | "replica" | "internal" | "edge". `None` for services that
+    /// aren't part of a cluster (or predate this field).
+    pub cluster_role: Option<String>,
+    /// Canvas group id, used to keep live-scaled replica/internal nodes
+    /// visually grouped with their cluster root (`groupSet`).
+    pub group_id: Option<String>,
+    /// Template-declared coordination-variable wiring for HA scale helpers,
+    /// stamped on the root service at conversion time. `None` for legacy
+    /// (pre-`clusterWiring`) Patroni clusters -- callers fall back to the
+    /// historical hardcoded Patroni wiring in that case (see
+    /// `cluster_scale::resolve_cluster_wiring`).
+    pub cluster_wiring: Option<ClusterWiring>,
+}
+
+/// Template-declared wiring map for HA scale helpers, mirroring
+/// `clusterWiringSchema` in `common/javascript/models/src/environment/schema.ts`.
+/// Lets `railway postgres ha scale` re-stamp coordination variables on an
+/// already-converted cluster without hardcoding any database-specific
+/// variable names. Set on the root service's `environment.config` entry.
+///
+/// In each format string, `{host}` is substituted with the node's
+/// private-domain reference and `{rootName}` with the cluster root's actual
+/// (possibly customer-renamed) service name.
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, JsonSchema, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ClusterWiring {
+    /// Variable on each internal service that holds that node's own identity
+    /// (e.g. `ETCD_NAME`). Stamped per node on internal scale.
+    pub internal_node_name_variable: Option<String>,
+    /// Variable on root + replica services that holds the comma-separated
+    /// coordinator hostname list (e.g. `PATRONI_ETCD3_HOSTS`).
+    pub coordinator_hosts_variable: Option<String>,
+    /// Port appended to each coordinator host (e.g. 2379 for etcd).
+    pub coordinator_port: Option<i64>,
+    /// Variable on each replica service that holds that replica's own
+    /// identity (e.g. `PATRONI_NAME`). Stamped per replica on clone.
+    pub replica_node_name_variable: Option<String>,
+    /// Variable on the edge service that holds the comma-separated data-node
+    /// endpoint list (e.g. `POSTGRES_NODES`).
+    pub data_nodes_variable: Option<String>,
+    /// Format for each data-node entry. `{host}`/`{rootName}` are
+    /// substituted as described above; the rest is literal.
+    pub data_nodes_entry_format: Option<String>,
+    /// Variable on root + replica services holding the consensus quorum.
+    /// Restamped to a majority (`floor(dataNodes / 2) + 1`) on replica scale.
+    pub quorum_variable: Option<String>,
 }
 
 #[skip_serializing_none]
@@ -292,4 +340,100 @@ pub fn prepare_config_for_duplication(mut config: EnvironmentConfig) -> Environm
     }
 
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::MockBackboard;
+    use serde_json::json;
+
+    fn environment_payload(config: serde_json::Value) -> serde_json::Value {
+        json!({
+            "environment": {
+                "id": "env-1",
+                "name": "production",
+                "config": config,
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn parses_services_and_tolerates_unknown_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockBackboard::spawn();
+        server.stub(
+            "GetEnvironmentConfig",
+            environment_payload(json!({
+                "services": {
+                    "svc-1": {
+                        "source": { "image": "ghcr.io/railwayapp-templates/postgres-ssl:16" },
+                        "variables": { "PGDATA": { "value": "/var/lib/postgresql/data" } },
+                        "parentServiceId": "svc-0",
+                        // Fields newer than this build must be ignored, not
+                        // fail the parse -- the blob evolves server-side.
+                        "someFutureField": { "nested": true },
+                    }
+                },
+                "unknownTopLevelSection": [1, 2, 3],
+            })),
+        );
+
+        let configs = server.configs(&dir);
+        let client = reqwest::Client::new();
+        let response = fetch_environment_config(&client, &configs, "env-1", false)
+            .await
+            .unwrap();
+
+        assert_eq!(response.name, "production");
+        let service = response.config.services.get("svc-1").unwrap();
+        assert_eq!(
+            service.source.as_ref().unwrap().image.as_deref(),
+            Some("ghcr.io/railwayapp-templates/postgres-ssl:16")
+        );
+        assert_eq!(service.parent_service_id.as_deref(), Some("svc-0"));
+
+        // The decrypt flag must reach the wire.
+        assert_eq!(
+            server.variables_for("GetEnvironmentConfig"),
+            vec![json!({ "id": "env-1", "decryptVariables": false })]
+        );
+    }
+
+    #[tokio::test]
+    async fn decrypt_flag_is_passed_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockBackboard::spawn();
+        server.stub("GetEnvironmentConfig", environment_payload(json!({})));
+
+        let configs = server.configs(&dir);
+        let client = reqwest::Client::new();
+        fetch_environment_config(&client, &configs, "env-1", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            server.variables_for("GetEnvironmentConfig")[0]["decryptVariables"],
+            json!(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_config_blob_fails_with_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockBackboard::spawn();
+        server.stub(
+            "GetEnvironmentConfig",
+            environment_payload(json!({ "services": "not-an-object" })),
+        );
+
+        let configs = server.configs(&dir);
+        let client = reqwest::Client::new();
+        let Err(err) = fetch_environment_config(&client, &configs, "env-1", false).await else {
+            panic!("malformed config must fail to parse");
+        };
+        assert!(
+            format!("{err:#}").contains("Failed to parse environment config"),
+            "unexpected error: {err:#}"
+        );
+    }
 }

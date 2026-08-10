@@ -7,12 +7,15 @@ use clap::error::ErrorKind;
 mod commands;
 use commands::*;
 use config::Configs;
+use errors::RailwayError;
 use is_terminal::IsTerminal;
 use util::{
     check_update::{UPDATE_CHECK_INTERVAL_HOURS, UpdateCheck},
     compare_semver::compare_semver,
 };
 
+#[cfg(test)]
+mod auth_sim;
 mod client;
 mod config;
 mod consts;
@@ -24,6 +27,8 @@ mod oauth;
 mod resources;
 mod subscription;
 mod table;
+#[cfg(test)]
+mod testkit;
 mod util;
 mod workspace;
 
@@ -36,9 +41,12 @@ mod telemetry;
 commands!(
     add,
     agent,
+    api,
     autoupdate,
     bucket,
     cdn,
+    cloud_agent as "ca",
+    code,
     completion,
     config,
     connect,
@@ -61,6 +69,7 @@ commands!(
     metrics,
     open,
     outbound_networking as "outbound-network",
+    postgres,
     project,
     private_network as "private-network",
     run(local),
@@ -428,7 +437,18 @@ async fn main() -> Result<()> {
     if command_needs_refresh(&cli) {
         if let Ok(mut configs) = Configs::new() {
             if let Err(e) = client::ensure_valid_token(&mut configs).await {
-                eprintln!("{}: {e}", "Warning: failed to refresh OAuth token".yellow());
+                // A revoked/expired login is the actual cause of the
+                // "Unauthorized" the command is about to fail with, so say so
+                // here rather than letting the generic message stand in for it.
+                // The credential has already been cleared by this point.
+                if matches!(
+                    e.downcast_ref::<RailwayError>(),
+                    Some(RailwayError::OAuthInvalidGrant(_))
+                ) {
+                    eprintln!("{}", format!("{e}").red());
+                } else {
+                    eprintln!("{}: {e}", "Warning: failed to refresh OAuth token".yellow());
+                }
             }
         }
     }
@@ -623,6 +643,9 @@ mod cli_tests {
         fn variable_legacy_flags() {
             assert_parses(&["variable", "--set", "KEY=value"]);
             assert_parses(&["variable", "--set", "KEY=value", "--set", "KEY2=value2"]);
+            // Empty VALUE is legal (sets the empty string); it used to fail
+            // clap parsing and abort the whole invocation, other pairs included.
+            assert_parses(&["variable", "--set", "KEY=", "--set", "KEY2=value2"]);
             assert_parses(&["variable", "-s", "myservice"]);
             assert_parses(&["variable", "-e", "production"]);
             assert_parses(&["variable", "--kv"]);
@@ -876,6 +899,112 @@ mod cli_tests {
             assert_parses(&["setup", "agent", "-y"]);
             assert_parses(&["setup", "agent", "--remote"]);
             assert_parses(&["setup", "agent", "--remote", "-y"]);
+        }
+
+        #[test]
+        fn cloud_agent_subcommands() {
+            assert_subcommand(&["ca"], "ca");
+            assert_parses(&["ca"]);
+            assert_parses(&["ca", "setup"]);
+            assert_parses(&["ca", "setup", "-y"]);
+            assert_parses(&["ca", "setup", "--show"]);
+            assert_parses(&["ca", "start", "--claude"]);
+            assert_parses(&["ca", "start", "--codex", "--new"]);
+        }
+
+        /// `railway ca` browses and `railway code` launches, but every launch
+        /// flag has to work on both — otherwise the split becomes a trap where
+        /// the flag you know only works on the command you didn't type.
+        #[test]
+        fn both_commands_take_the_same_launch_flags() {
+            for name in ["code", "ca"] {
+                for flags in [
+                    vec!["--claude"],
+                    vec!["--codex", "--new"],
+                    vec!["--grok", "--keep-awake"],
+                    vec!["--rm"],
+                    vec!["--claude", "--refresh-auth"],
+                    vec!["--codex", "--variable", "A=b"],
+                    vec!["--codex", "--env-file", ".env"],
+                    vec!["--claude", "-p", "proj", "-e", "env"],
+                ] {
+                    let args: Vec<&str> = std::iter::once(name).chain(flags).collect();
+                    assert_parses(&args);
+                }
+            }
+        }
+
+        /// The subcommands belong to `ca` alone — `code` is the launcher.
+        #[test]
+        fn subcommands_live_on_ca() {
+            let matches = parse(&["ca", "setup"]).unwrap();
+            let (_, sub) = matches.subcommand().unwrap();
+            assert_eq!(sub.subcommand_name(), Some("setup"));
+
+            // On `code`, `setup` is a trailing agent argument — which is why
+            // `code::command` refuses it with a pointer to `railway ca setup`
+            // rather than running it on the VM.
+            let matches = parse(&["code", "setup"]).unwrap();
+            let (_, sub) = matches.subcommand().unwrap();
+            assert_eq!(sub.subcommand_name(), None);
+            assert_eq!(
+                sub.get_many::<String>("agent_args")
+                    .map(|v| v.cloned().collect::<Vec<_>>()),
+                Some(vec!["setup".to_string()])
+            );
+        }
+
+        #[test]
+        fn trailing_agent_args_survive_on_both_names() {
+            for name in ["code", "ca"] {
+                assert_parses(&[name, "--codex", "--", "exec", "explain this codebase"]);
+            }
+            assert_parses(&["ca", "start", "--codex", "--", "--version"]);
+        }
+
+        #[test]
+        fn api_command_parses() {
+            assert_subcommand(&["api", "{ me { id } }"], "api");
+            assert_parses(&["api", "--file", "query.graphql"]);
+            assert_parses(&[
+                "api",
+                "--file",
+                "query.graphql",
+                "--variables",
+                "@vars.json",
+                "--var",
+                "limit=10",
+                "--raw-var",
+                "name=web",
+                "--operation-name",
+                "Project",
+                "--compact",
+            ]);
+            assert_parses(&[
+                "api",
+                "--file",
+                "query.graphql",
+                "--variables",
+                "@vars.json",
+                "--allow-errors",
+            ]);
+            assert_parses(&["api", "schema"]);
+            assert_parses(&["api", "schema", "--compact"]);
+            assert_parses(&["api", "search", "deployment", "--kind", "mutation"]);
+            assert_parses(&["api", "describe", "ServiceInstanceUpdateInput"]);
+        }
+
+        #[test]
+        fn api_commands_need_auth_refresh() {
+            let search = parse(&["api", "search", "serviceInstance"]).unwrap();
+            let describe = parse(&["api", "describe", "ServiceInstanceUpdateInput"]).unwrap();
+            let schema = parse(&["api", "schema"]).unwrap();
+            let execute = parse(&["api", "{ me { id } }"]).unwrap();
+
+            assert!(command_needs_refresh(&search));
+            assert!(command_needs_refresh(&describe));
+            assert!(command_needs_refresh(&schema));
+            assert!(command_needs_refresh(&execute));
         }
 
         #[test]

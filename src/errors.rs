@@ -1,6 +1,30 @@
 use reqwest::header::InvalidHeaderValue;
 use thiserror::Error;
 
+/// Substrings that identify an authorization failure in a *rendered* error
+/// message.
+///
+/// The MCP tool layer flattens `RailwayError` into an opaque `McpError` string
+/// before its dispatcher sees it, so recovery there has to match on text. These
+/// markers are declared next to the variants they describe, and
+/// `auth_failure_markers_cover_unauthorized_variants` fails if a variant's
+/// message stops containing one — otherwise rewording an `#[error(...)]` would
+/// silently disable mid-session re-auth.
+pub const AUTH_FAILURE_MARKERS: &[&str] = &["Unauthorized", "Not authenticated"];
+
+/// `Retry-After` turned into something worth reading. The server sends it on
+/// every 429; without it the only honest thing to say is "later".
+fn ratelimit_message(retry_after_secs: Option<u64>) -> String {
+    match retry_after_secs {
+        Some(secs) if secs > 90 => format!(
+            "You are being ratelimited. Try again in about {} minutes",
+            secs.div_ceil(60)
+        ),
+        Some(secs) => format!("You are being ratelimited. Try again in {secs} seconds"),
+        None => "You are being ratelimited. Please try again later".to_string(),
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum RailwayError {
     #[error("Unauthorized. Please login with `railway login`")]
@@ -100,8 +124,8 @@ pub enum RailwayError {
     #[error("Connection URL should point to the Railway TCP proxy")]
     InvalidConnectionVariable,
 
-    #[error("You are being ratelimited. Please try again later")]
-    Ratelimited,
+    #[error("{}", ratelimit_message(*retry_after_secs))]
+    Ratelimited { retry_after_secs: Option<u64> },
 
     #[error("Device code expired. Please run `railway login` again.")]
     OAuthDeviceCodeExpired,
@@ -109,8 +133,18 @@ pub enum RailwayError {
     #[error("Authorization was denied by the user.")]
     OAuthAccessDenied,
 
-    #[error("Token refresh failed: {0}. Please run `railway login` again.")]
+    /// Transient refresh failure: the stored credentials are still valid, so
+    /// this must NOT tell the user to log in again. A backboard blip used to
+    /// send everyone who refreshed during it to `railway login` for nothing.
+    #[error("Couldn't refresh your session: {0}. This is usually temporary — please try again.")]
     OAuthRefreshFailed(String),
+
+    /// The server rejected the stored refresh token with `invalid_grant` —
+    /// it was revoked, expired, or never existed. Unlike every other refresh
+    /// failure this is *permanent*: retrying with the same credential can
+    /// never succeed, so the caller clears it instead of looping forever.
+    #[error("Your saved login is no longer valid ({0}). Please run `railway login` again.")]
+    OAuthInvalidGrant(String),
 
     #[error("OAuth error: {0}")]
     OAuthError(String),
@@ -154,10 +188,11 @@ impl RailwayError {
             RailwayError::TwoFactorEnforcementRequired(_, _) => "TWO_FACTOR_REQUIRED",
             RailwayError::ConnectionVariableNotFound(_) => "CONNECTION_VARIABLE_NOT_FOUND",
             RailwayError::InvalidConnectionVariable => "INVALID_CONNECTION_VARIABLE",
-            RailwayError::Ratelimited => "RATELIMITED",
+            RailwayError::Ratelimited { .. } => "RATELIMITED",
             RailwayError::OAuthDeviceCodeExpired => "OAUTH_DEVICE_CODE_EXPIRED",
             RailwayError::OAuthAccessDenied => "OAUTH_ACCESS_DENIED",
             RailwayError::OAuthRefreshFailed(_) => "OAUTH_REFRESH_FAILED",
+            RailwayError::OAuthInvalidGrant(_) => "OAUTH_INVALID_GRANT",
             RailwayError::OAuthError(_) => "OAUTH_ERROR",
             RailwayError::NotAuthenticated => "NOT_AUTHENTICATED",
         }
@@ -168,7 +203,7 @@ impl RailwayError {
     /// embed guidance in their message.
     pub fn hint(&self) -> Option<&'static str> {
         match self {
-            RailwayError::NotAuthenticated => {
+            RailwayError::NotAuthenticated | RailwayError::OAuthInvalidGrant(_) => {
                 Some("Run `railway login` to authenticate, then re-run.")
             }
             RailwayError::NoLinkedProject | RailwayError::ProjectNotFound => {
@@ -176,6 +211,29 @@ impl RailwayError {
             }
             RailwayError::NoServiceLinked => Some("Run `railway service` to link a service."),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every variant that means "the server refused this on authorization" must
+    /// be recognisable from its rendered message alone.
+    #[test]
+    fn auth_failure_markers_cover_unauthorized_variants() {
+        let variants = [
+            RailwayError::Unauthorized,
+            RailwayError::UnauthorizedLogin,
+            RailwayError::UnauthorizedToken("RAILWAY_TOKEN".to_string()),
+        ];
+        for variant in variants {
+            let rendered = variant.to_string();
+            assert!(
+                AUTH_FAILURE_MARKERS.iter().any(|m| rendered.contains(m)),
+                "no AUTH_FAILURE_MARKERS entry matches {rendered:?}; mid-session re-auth would stop working for this variant"
+            );
         }
     }
 }

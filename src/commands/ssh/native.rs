@@ -46,6 +46,26 @@ fn base_ssh_command(ssh_target: &str, identity_file: Option<&Path>) -> (Command,
     (cmd, format!("{ssh_target}@{host}"))
 }
 
+/// The relay destination for a target: `<target>@<relay-host>`.
+///
+/// A relay target (`agent:<env>:<id>`, `service:…`) is a *username* on the
+/// relay host, not a hostname. Handing the bare target to ssh asks the resolver
+/// to look it up as a host, which fails with "Could not resolve hostname" —
+/// exposed here so callers that build their own invocation, like the TUI's pty
+/// session, cannot rediscover that the hard way.
+pub fn relay_destination(ssh_target: &str) -> String {
+    let (host, _) = ssh_relay();
+    format!("{ssh_target}@{host}")
+}
+
+/// `-p <port>` when the relay listens somewhere other than 22, empty otherwise.
+pub fn relay_port_args() -> Vec<String> {
+    match ssh_relay() {
+        (_, Some(port)) => vec!["-p".to_string(), port.to_string()],
+        (_, None) => Vec::new(),
+    }
+}
+
 /// Get the service instance ID for a service in an environment
 pub async fn get_service_instance_id(
     client: &Client,
@@ -72,6 +92,22 @@ pub async fn get_service_instance_id(
 /// CLI doesn't need to distinguish — it passes `workspaceId: null` and
 /// the resolver defaults from `ctx.workspace.id` when present.
 pub async fn ensure_ssh_key(client: &Client, configs: &Configs) -> Result<Option<PathBuf>> {
+    ensure_ssh_key_impl(client, configs, true).await
+}
+
+/// `ensure_ssh_key` without the "Using SSH key from ..." announcement when a
+/// registered key is already in place — for flows like `railway code` where
+/// ssh is plumbing, not the product. First-run registration still prompts
+/// and prints normally.
+pub async fn ensure_ssh_key_quiet(client: &Client, configs: &Configs) -> Result<Option<PathBuf>> {
+    ensure_ssh_key_impl(client, configs, false).await
+}
+
+async fn ensure_ssh_key_impl(
+    client: &Client,
+    configs: &Configs,
+    announce: bool,
+) -> Result<Option<PathBuf>> {
     let local_keys = find_local_ssh_keys().await?;
 
     if local_keys.is_empty() {
@@ -93,13 +129,15 @@ pub async fn ensure_ssh_key(client: &Client, configs: &Configs) -> Result<Option
     });
 
     if let Some(key) = registered_local {
-        match &key.source {
-            SshKeySource::File(path) => eprintln!(
-                "Using SSH key from file {}: {}",
-                path.display(),
-                key.key_name()
-            ),
-            SshKeySource::Agent => eprintln!("Using SSH key from agent: {}", key.key_name()),
+        if announce {
+            match &key.source {
+                SshKeySource::File(path) => eprintln!(
+                    "Using SSH key from file {}: {}",
+                    path.display(),
+                    key.key_name()
+                ),
+                SshKeySource::Agent => eprintln!("Using SSH key from agent: {}", key.key_name()),
+            }
         }
         return Ok(identity_for(key));
     }
@@ -274,10 +312,71 @@ pub fn run_native_ssh(
     identity_file: Option<&Path>,
     durable: Option<DurableResume<'_>>,
 ) -> Result<i32> {
+    run_native_ssh_with_opts(service_instance_id, command, identity_file, durable, &[])
+}
+
+/// `run_native_ssh` with extra `ssh` options (each element one argv entry,
+/// e.g. `["-o", "ControlMaster=auto"]`). Lets callers opt into connection
+/// multiplexing without changing the shared default path.
+/// Turn off mouse tracking after an interactive session.
+///
+/// An agent or editor on the far side enables it for its own use. Exiting
+/// cleanly turns it off again; being detached from — which is the normal way to
+/// leave a durable session — does not, and the modes stay set on the terminal
+/// that gets handed back. The symptom is unmistakable and cannot be cleared
+/// from the shell: every pointer movement arrives at the prompt as `35;21;32M`.
+pub fn clear_mouse_tracking() {
+    use std::io::Write;
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    let _ = std::io::stdout().flush();
+}
+
+/// Prepare the remote command words for OpenSSH.
+///
+/// ssh(1) concatenates every remote-command word with single spaces into ONE
+/// string and hands that to the remote login shell — argv boundaries do not
+/// survive the trip. Passed through raw, a multi-arg invocation like
+/// `railway ssh sh -c 'redis-cli -a "$PW" PING && echo ok'` reaches the
+/// remote shell as `sh -c redis-cli -a "$PW" PING && echo ok`, so `sh -c`
+/// takes only `redis-cli` as its script and the rest leaks into `$0`/`$1`
+/// and a second `&&` command.
+///
+/// Quoting each word when the caller passed MORE than one makes the remote
+/// shell re-split back to exactly the caller's argv (`docker exec` /
+/// `kubectl exec` semantics). A single word keeps passing through raw: it IS
+/// the remote shell line — today's documented usage — and quoting it would
+/// collapse the whole line into one command word.
+fn quote_remote_command(args: &[String]) -> Vec<String> {
+    if args.len() <= 1 {
+        return args.to_vec();
+    }
+    args.iter()
+        .map(|arg| match shlex::try_quote(arg) {
+            Ok(quoted) => quoted.into_owned(),
+            // try_quote only fails on interior NUL bytes, which cannot occur
+            // in OS-provided argv; keep the raw word rather than dying.
+            Err(_) => arg.clone(),
+        })
+        .collect()
+}
+
+pub fn run_native_ssh_with_opts(
+    service_instance_id: &str,
+    command: Option<&[String]>,
+    identity_file: Option<&Path>,
+    durable: Option<DurableResume<'_>>,
+    extra_opts: &[String],
+) -> Result<i32> {
     let stdin_tty = std::io::stdin().is_terminal();
     let stdout_tty = std::io::stdout().is_terminal();
 
     let (mut ssh_cmd, target) = base_ssh_command(service_instance_id, identity_file);
+    for opt in extra_opts {
+        ssh_cmd.arg(opt);
+    }
 
     if let Some(durable) = durable {
         // Both env keys ride a single SetEnv directive: pre-8.7 OpenSSH only
@@ -308,7 +407,7 @@ pub fn run_native_ssh(
     ssh_cmd.arg(&target);
 
     if let Some(cmd_args) = command {
-        for arg in cmd_args {
+        for arg in quote_remote_command(cmd_args) {
             ssh_cmd.arg(arg);
         }
     }
@@ -421,6 +520,14 @@ pub fn spawn_native_ssh_forward(
     identity_file: Option<&Path>,
     forwards: &[PortForward],
 ) -> Result<ForwardGuard> {
+    // Refuse to start if something already owns a requested local port. The
+    // readiness probe below can only prove that *someone* is listening, not
+    // that it is our ssh child, so a pre-existing listener would otherwise be
+    // accepted as the tunnel and receive whatever the caller sends through it.
+    for forward in forwards {
+        ensure_local_port_free(forward.local_port)?;
+    }
+
     let (mut ssh_cmd, target) = base_ssh_command(ssh_target, identity_file);
     apply_forward_options(&mut ssh_cmd, forwards);
     ssh_cmd.arg(&target);
@@ -454,6 +561,24 @@ pub fn spawn_native_ssh_forward(
     Ok(guard)
 }
 
+/// Fails unless nothing is currently listening on `127.0.0.1:<port>`. Binding
+/// is the only portable way to ask; the socket is closed immediately so ssh can
+/// take the port, which leaves a small window that the post-probe liveness
+/// re-check in `wait_for_forward_ready` closes.
+fn ensure_local_port_free(port: u16) -> Result<()> {
+    match std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => bail!(
+            "Local port {port} is already in use. Pick a free port with --port, or stop the process using it.\n\
+             Railway will not send traffic to a port it did not open."
+        ),
+        Err(err) => Err(err).with_context(|| format!("Failed to check local port {port}")),
+    }
+}
+
 /// Poll the forwarded local ports until they accept a TCP connection. Bails if
 /// ssh exits first (e.g. `ExitOnForwardFailure` tripping on a busy local port)
 /// or the tunnel doesn't come up within the deadline.
@@ -468,11 +593,113 @@ fn wait_for_forward_ready(guard: &mut ForwardGuard, forwards: &[PortForward]) ->
             TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
         });
         if all_up {
+            // A successful connect only proves someone is listening. ssh reports
+            // a failed bind asynchronously, so re-check that our child is still
+            // alive before treating the listener as ours — otherwise a port that
+            // was taken between the pre-flight check and the bind would be
+            // reported as a ready tunnel.
+            if let Some(status) = guard.child.try_wait()? {
+                bail!(
+                    "SSH tunnel exited while coming up ({status}). The local port is owned by another process."
+                );
+            }
             return Ok(());
         }
         if Instant::now() >= deadline {
             bail!("Timed out waiting for the SSH tunnel to become ready on 127.0.0.1");
         }
         sleep(Duration::from_millis(150));
+    }
+}
+
+/// Run a non-interactive command on the target with optional bytes fed to its
+/// stdin, and stdout + stderr captured. Built for agent-launcher plumbing
+/// (`railway code`): secret payloads (credentials) ride stdin so they never
+/// appear in an argv, small reads come back on stdout, and stderr comes back
+/// so callers can tell transport failures (host key, relay refusal) apart
+/// from remote-command failures instead of showing a bare exit code.
+pub fn run_native_ssh_captured(
+    ssh_target: &str,
+    command: &str,
+    identity_file: Option<&Path>,
+    stdin_payload: Option<&[u8]>,
+    extra_opts: &[String],
+) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+    use std::io::Write;
+
+    let (mut ssh_cmd, target) = base_ssh_command(ssh_target, identity_file);
+    for opt in extra_opts {
+        ssh_cmd.arg(opt);
+    }
+    ssh_cmd.arg("-T");
+    ssh_cmd.arg(&target);
+    ssh_cmd.arg(command);
+    ssh_cmd.stdin(if stdin_payload.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    ssh_cmd.stdout(Stdio::piped());
+    ssh_cmd.stderr(Stdio::piped());
+
+    let mut child = ssh_cmd.spawn().context("Failed to execute ssh command")?;
+    if let Some(payload) = stdin_payload {
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        stdin.write_all(payload)?;
+        // Drop closes the pipe so the remote `cat` sees EOF.
+    }
+    let output = child.wait_with_output()?;
+    Ok((
+        output.status.code().unwrap_or(1),
+        output.stdout,
+        output.stderr,
+    ))
+}
+
+#[cfg(test)]
+mod quote_remote_command_tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The invariant that matters: after ssh joins the words with spaces and
+    /// the remote shell re-splits them, the original argv comes back.
+    fn remote_shell_split(quoted: &[String]) -> Vec<String> {
+        shlex::split(&quoted.join(" ")).expect("quoted words must re-split")
+    }
+
+    #[test]
+    fn a_single_word_is_the_remote_shell_line_and_passes_through_raw() {
+        let input = args(&["redis-cli -a \"$PW\" PING && echo ok"]);
+        assert_eq!(quote_remote_command(&input), input);
+    }
+
+    #[test]
+    fn plain_words_survive_unchanged() {
+        let input = args(&["ls", "-la", "/data"]);
+        assert_eq!(quote_remote_command(&input), input);
+    }
+
+    #[test]
+    fn argv_boundaries_survive_the_join_and_remote_resplit() {
+        let input = args(&["sh", "-c", "redis-cli -a \"$PW\" PING && echo ok"]);
+        let quoted = quote_remote_command(&input);
+        assert_eq!(remote_shell_split(&quoted), input);
+    }
+
+    #[test]
+    fn spaces_quotes_and_dollars_stay_inside_their_word() {
+        let input = args(&["echo", "a b", "it's", "$HOME", "x;y|z"]);
+        let quoted = quote_remote_command(&input);
+        assert_eq!(remote_shell_split(&quoted), input);
+    }
+
+    #[test]
+    fn empty_words_are_preserved_as_empty_words() {
+        let input = args(&["printf", "%s", ""]);
+        let quoted = quote_remote_command(&input);
+        assert_eq!(remote_shell_split(&quoted), input);
     }
 }
