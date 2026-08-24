@@ -41,18 +41,93 @@ const CARD_GUTTER: usize = 3;
 /// Width of the tree column in Manage, borders included.
 const TREE_W: u16 = 32;
 
+/// What a dialog spends on chrome: its two border cells. The breathing room
+/// lives *outside* the boxes — see [`page`] — not between a border and its
+/// text.
+const DIALOG_CHROME_X: u16 = 2;
+const DIALOG_CHROME_Y: u16 = 2;
+
+/// Columns of space between the terminal's edge and the UI.
+const PAGE_MARGIN_X: u16 = 2;
+/// Rows of the same. Half the columns, because a terminal cell is about twice
+/// as tall as it is wide — the same gap on screen on every side.
+const PAGE_MARGIN_Y: u16 = 1;
+
+/// What the page margin leaves of a `width` × `height` terminal. Skipped when
+/// the terminal is too small to spend cells on air — a cramped layout beats a
+/// truncated one.
+///
+/// The single source of that answer: [`page`] shapes what is drawn with it,
+/// and [`session_pane_size`] shapes the PTY with it. They must agree — an
+/// emulator wrapping wider than its pane puts the last columns of every row
+/// somewhere the screen never shows, which shears anything long enough to
+/// wrap (an OAuth URL loses four characters at every fold).
+fn page_size(width: u16, height: u16) -> (u16, u16) {
+    if width < 40 || height < 12 {
+        (width, height)
+    } else {
+        (width - PAGE_MARGIN_X * 2, height - PAGE_MARGIN_Y * 2)
+    }
+}
+
+/// The page: the frame minus a slim outer margin, so boxes never press
+/// against the terminal's edges. Every screen and floating card lays out
+/// against this.
+fn page(f: &Frame) -> Rect {
+    let area = f.area();
+    let (width, height) = page_size(area.width, area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+/// The prompt box's shape — width, and height in rows including borders —
+/// shared by the menu's prompt and the ⌥p composer so the two read as the
+/// same control. Text rows plus the border: twice the writing room of the
+/// original two rows on screens with the height for it — a prompt is a
+/// paragraph these days, not a title — and a compact variant below that.
+fn prompt_box_size(area: Rect) -> (u16, u16) {
+    let height = if area.height >= 30 { 6 } else { 2 } + DIALOG_CHROME_Y;
+    let width = 74.min(area.width.saturating_sub(2)).max(40.min(area.width));
+    (width, height)
+}
+
+/// The chrome every floating card shares.
+///
+/// Opaque fill, because these sit *on top of* the screen rather than in it:
+/// with only [`Clear`] underneath, the terminal's own background shows through
+/// and the card reads as a hole punched in the page instead of a dialog above
+/// it.
+fn dialog_block(theme: &Theme) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.surface).fg(theme.fg))
+}
+
+/// One inverse-styled key badge, e.g. ` ^t `. The building block of
+/// [`chord_spans`], and also used solo wherever a shortcut sits beside the
+/// thing it acts on instead of in the footer's own chord list.
+fn chord_badge(theme: &Theme, chord: &str) -> Span<'static> {
+    Span::styled(
+        format!(" {chord} "),
+        Style::default()
+            .fg(theme.on_accent)
+            .bg(theme.accent_dim)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
 /// Footer chords: an inverse badge for the key, dim text for what it does.
 /// Shared so the menu and the manage screen read as the same product.
 fn chord_spans(theme: &Theme, chords: &[(&str, &str)]) -> Vec<Span<'static>> {
     let mut spans = Vec::with_capacity(chords.len() * 2);
     for (chord, what) in chords {
-        spans.push(Span::styled(
-            format!(" {chord} "),
-            Style::default()
-                .fg(theme.on_accent)
-                .bg(theme.accent_dim)
-                .add_modifier(Modifier::BOLD),
-        ));
+        spans.push(chord_badge(theme, chord));
         spans.push(Span::styled(
             format!(" {what}   "),
             Style::default().fg(theme.dim),
@@ -114,29 +189,111 @@ pub fn render_with_layout(app: &App, f: &mut Frame) -> (PaneRects, Option<String
 fn render_inner(app: &App, f: &mut Frame, rects: &mut PaneRects) {
     f.render_widget(Clear, f.area());
     render_screen(app, f, rects);
-    render_toast(app, f);
+    render_ssh_gate(app, f);
+    render_toast(app, f, rects);
+}
+
+/// The register-your-SSH-key question, centered over whatever raised it. Up
+/// only while [`App::ssh_gate`] holds a connect (or setup's offer); the next
+/// key answers it — see the gate block at the top of [`App::on_key`].
+fn render_ssh_gate(app: &App, f: &mut Frame) {
+    let Some(gate) = app.ssh_gate.as_ref() else {
+        return;
+    };
+    let theme = app.theme;
+    let area = page(f);
+    // Name and fingerprint on their own lines: together they outrun the card
+    // and wrap mid-fingerprint, which reads as garbage. Apart, both fit.
+    // Everything reads in the foreground — this card is the only thing asking
+    // for attention while it is up, so nothing on it is background noise.
+    let body = Style::default().fg(theme.fg);
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("  {}", gate.offer.name),
+            body.add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(format!("  {}", gate.offer.fingerprint), body)),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Agents are reached over SSH, and Railway only answers",
+            body,
+        )),
+        Line::from(Span::styled(
+            "  keys it knows. Registered once, it covers every agent.",
+            body,
+        )),
+        Line::from(""),
+        // The footers' badge chords, centered: the question's answers are the
+        // card's focal point, not another row of copy.
+        Line::from(vec![
+            chord_badge(theme, "y"),
+            Span::styled(" Yes — register this key", body),
+            Span::raw("    "),
+            chord_badge(theme, "n"),
+            Span::styled(" No, not now", body),
+        ])
+        .alignment(Alignment::Center),
+    ];
+    let width = (55 + DIALOG_CHROME_X).min(area.width.saturating_sub(4));
+    let height = (lines.len() as u16 + DIALOG_CHROME_Y).min(area.height.saturating_sub(2));
+    let panel = centered(width, height, area);
+    f.render_widget(Clear, panel);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            dialog_block(theme).title(Span::styled(
+                " Register your SSH key with Railway? ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        ),
+        panel,
+    );
 }
 
 /// The corner confirmation, over whatever is underneath it.
 ///
-/// Bottom right, clear of the key strip on the left of the same row and of the
-/// `? keys` badge on its right — it sits a line above both.
-fn render_toast(app: &App, f: &mut Frame) {
+/// A confirmation sits bottom right, clear of the key strip on the left of the
+/// same row and of the `? keys` badge on its right — a glance, out of the way.
+/// An error is the thing that needs reading, so it sits front and center at
+/// the bottom of the session pane (or of the page, when no pane is drawn).
+fn render_toast(app: &App, f: &mut Frame, rects: &PaneRects) {
     let Some(toast) = app.toast.as_ref().filter(|toast| !toast.expired()) else {
         return;
     };
     let theme = app.theme;
-    let area = f.area();
+    let area = page(f);
     let text = format!(" {}  {}  ", if toast.ok { "✓" } else { "✕" }, toast.text);
-    let w = (text.chars().count() as u16 + 2).min(area.width);
+    let w = (text.chars().count() as u16 + DIALOG_CHROME_X).min(area.width);
     let h = 3.min(area.height);
-    // Clear of the key strip on the last row and of the pane border above it,
-    // so it floats inside the pane rather than colliding with its corner.
-    let rect = Rect {
-        x: area.width.saturating_sub(w + 2),
-        y: area.height.saturating_sub(h + 2),
-        width: w,
-        height: h,
+    let rect = if toast.ok {
+        // Clear of the key strip on the last row and of the pane border above
+        // it, so it floats inside the pane rather than colliding with its
+        // corner.
+        Rect {
+            x: area.right().saturating_sub(w + 2),
+            y: area.bottom().saturating_sub(h + 2),
+            width: w,
+            height: h,
+        }
+    } else {
+        let host = if rects.session.w > 0 {
+            Rect {
+                x: rects.session.x,
+                y: rects.session.y,
+                width: rects.session.w,
+                height: rects.session.h,
+            }
+        } else {
+            area
+        };
+        let w = w.min(host.width);
+        Rect {
+            x: host.x + host.width.saturating_sub(w) / 2,
+            y: host.bottom().saturating_sub(h + 1).max(host.y),
+            width: w,
+            height: h,
+        }
     };
     let accent = if toast.ok {
         theme.accent
@@ -145,12 +302,8 @@ fn render_toast(app: &App, f: &mut Frame) {
     };
     f.render_widget(Clear, rect);
     f.render_widget(
-        Paragraph::new(Span::styled(text, Style::default().fg(theme.fg))).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(accent)),
-        ),
+        Paragraph::new(Span::styled(text, Style::default().fg(theme.fg)))
+            .block(dialog_block(theme).border_style(Style::default().fg(accent))),
         rect,
     );
 }
@@ -161,6 +314,10 @@ fn render_screen(app: &App, f: &mut Frame, rects: &mut PaneRects) {
             render_menu(app, f, rects);
             render_wizard(app, f);
         }
+        Screen::Settings => {
+            render_menu(app, f, rects);
+            render_settings(app, f);
+        }
         Screen::Menu => render_menu(app, f, rects),
         Screen::Manage => render_manage(app, f, rects),
         Screen::TargetPick => {
@@ -170,6 +327,14 @@ fn render_screen(app: &App, f: &mut Frame, rects: &mut PaneRects) {
         Screen::AgentPick => {
             render_menu(app, f, rects);
             render_agent_pick(app, f);
+        }
+        Screen::HarnessPick => {
+            render_manage(app, f, rects);
+            render_harness_pick(app, f);
+        }
+        Screen::ManagePrompt => {
+            render_manage(app, f, rects);
+            render_manage_prompt(app, f);
         }
     }
 }
@@ -207,15 +372,16 @@ fn centered(width: u16, height: u16, area: Rect) -> Rect {
 
 fn render_menu(app: &App, f: &mut Frame, rects: &mut PaneRects) {
     let theme = app.theme;
-    let area = f.area();
+    let area = page(f);
     let big = area.width >= BANNER_W + 8 && area.height >= 26;
     let banner_h = if big { BANNER_H } else { 1 };
-    let prompt_h = if area.height >= 30 { 6 } else { 4 };
-    let panel_w = 74.min(area.width.saturating_sub(2)).max(40.min(area.width));
+    let (panel_w, prompt_h) = prompt_box_size(area);
+    // The room around the prompt lives outside its outline, not inside it.
+    let prompt_gap = if area.height >= 30 { 2 } else { 1 };
     let cards = app.cards();
     // Descriptions cost rows, and on a short screen those rows come out of the
     // prompt box. Names only, rather than a menu with no prompt on it.
-    let chrome = banner_h + prompt_h + 12;
+    let chrome = banner_h + prompt_h + prompt_gap * 2 + 10;
     let mut block = card_block(&cards, panel_w as usize, true);
     if chrome + block.height(cards.len()) > area.height {
         block = card_block(&cards, panel_w as usize, false);
@@ -226,13 +392,13 @@ fn render_menu(app: &App, f: &mut Frame, rects: &mut PaneRects) {
 
     let rows = Layout::vertical([
         Constraint::Length(banner_h),
-        Constraint::Length(1), // breathing room under the wordmark
-        Constraint::Length(1), // CLOUD AGENTS
-        Constraint::Length(1), // title
-        Constraint::Length(1), // subtitle
-        Constraint::Length(1), // gap
+        Constraint::Length(1),          // breathing room under the wordmark
+        Constraint::Length(1),          // CLOUD AGENTS
+        Constraint::Length(1),          // title
+        Constraint::Length(1),          // subtitle
+        Constraint::Length(prompt_gap), // the prompt's room, outside its outline
         Constraint::Length(prompt_h),
-        Constraint::Length(1), // gap
+        Constraint::Length(prompt_gap), // and the same below
         Constraint::Length(cards_h),
         Constraint::Min(0),
         Constraint::Length(1), // target
@@ -294,16 +460,12 @@ fn render_menu(app: &App, f: &mut Frame, rects: &mut PaneRects) {
         MenuFocus::Prompt => &[
             ("enter", "launch"),
             ("shift+tab", "agent"),
-            ("^t", "target"),
-            ("⌥t", "theme"),
-            ("⌥s", "setup"),
+            ("⌥s", "settings"),
         ],
         MenuFocus::Cards => &[
             ("↑↓", "select"),
             ("enter", "open"),
-            ("^t", "target"),
-            ("⌥t", "theme"),
-            ("⌥s", "setup"),
+            ("⌥s", "settings"),
             ("q", "quit"),
         ],
     };
@@ -313,26 +475,28 @@ fn render_menu(app: &App, f: &mut Frame, rects: &mut PaneRects) {
     );
 }
 
-/// `Target Project  name (environment)`, or an invitation to set one.
+/// `^t  Target Project  name (environment)`, or an invitation to set one.
+/// The shortcut sits right on the field it changes rather than in the
+/// footer's own chord list, which otherwise says nothing about what "target"
+/// even refers to.
 fn target_line(app: &App) -> Line<'static> {
     let theme = app.theme;
-    let label = Span::styled(
-        "Target Project  ",
-        Style::default().fg(theme.dim).add_modifier(Modifier::BOLD),
-    );
-    match app.target.as_ref() {
-        Some(target) => Line::from(vec![
-            label,
-            Span::styled(
-                format!("{} ({})", target.project_name, target.environment_name),
-                Style::default().fg(theme.accent),
-            ),
-        ]),
-        None => Line::from(vec![
-            label,
-            Span::styled("not set", Style::default().fg(theme.pending)),
-        ]),
-    }
+    let mut spans = vec![
+        chord_badge(theme, "^t"),
+        Span::raw(" "),
+        Span::styled(
+            "Target Project  ",
+            Style::default().fg(theme.dim).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    spans.push(match app.target.as_ref() {
+        Some(target) => Span::styled(
+            format!("{} ({})", target.project_name, target.environment_name),
+            Style::default().fg(theme.accent),
+        ),
+        None => Span::styled("not set", Style::default().fg(theme.pending)),
+    });
+    Line::from(spans)
 }
 
 /// The wait, with the task in front of you.
@@ -366,12 +530,12 @@ fn render_loading(app: &App, f: &mut Frame, area: Rect) {
     };
 
     const STEP_ROWS: u16 = 9;
-    let task_h = match loading.prompt.as_deref() {
-        // Three lines of task plus its border: a prompt is a sentence, and the
-        // whole point of showing it is not making the user wonder what is
-        // starting.
-        Some(_) => 5,
-        None => 0,
+    // The echoed prompt reuses the main screen's box wholesale — same width,
+    // same height — so the transition reads as the box you typed in coming
+    // along, not a different card summarizing what you wrote.
+    let (task_w, task_h) = match loading.prompt.as_deref() {
+        Some(_) => prompt_box_size(area),
+        None => (0, 0),
     };
     // Size the panel to its content and centre *that*, rather than letting it
     // span the pane: the steps read as a left-aligned block, and a block the
@@ -390,12 +554,20 @@ fn render_loading(app: &App, f: &mut Frame, area: Rect) {
         // A floor only so an empty panel is not a sliver; anything larger pads
         // the panel past its content and the centring visibly drifts left.
         .clamp(20, area.width.max(1) as usize) as u16;
-    let panel = centered(content_w, (STEP_ROWS + task_h + 4).min(area.height), area);
+    // A prompt box brings a row of air below it, so the steps don't sit
+    // against its border.
+    let task_gap = if task_h > 0 { 1 } else { 0 };
+    let panel = centered(
+        content_w,
+        (STEP_ROWS + task_h + task_gap + 4).min(area.height),
+        area,
+    );
     let rows = Layout::vertical([
         Constraint::Length(1), // title
         Constraint::Length(1), // target
         Constraint::Length(1), // gap
         Constraint::Length(task_h),
+        Constraint::Length(task_gap),
         Constraint::Length(STEP_ROWS),
         Constraint::Min(0),
         Constraint::Length(1), // hint
@@ -424,17 +596,20 @@ fn render_loading(app: &App, f: &mut Frame, area: Rect) {
     );
 
     if let Some(prompt) = loading.prompt.as_deref() {
-        // A third of the pane, centred: a fixed frame the task wraps inside,
-        // rather than a frame the task drags open.
-        let task_area = centered((area.width / 3).max(24), task_h, rows[3]);
+        // Centered in the pane, not in the (narrower) steps panel: the box is
+        // the pane-wide element the steps sit under.
+        let task_area = Rect {
+            x: area.x + area.width.saturating_sub(task_w) / 2,
+            y: rows[3].y,
+            width: task_w.min(area.width),
+            height: rows[3].height,
+        };
         f.render_widget(
             Paragraph::new(prompt.to_string())
                 .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
+                    dialog_block(theme)
                         .border_style(Style::default().fg(theme.accent_dim))
-                        .title(Span::styled(" Task ", Style::default().fg(theme.dim))),
+                        .title(Span::styled(" Prompt ", Style::default().fg(theme.dim))),
                 )
                 .style(Style::default().fg(theme.fg))
                 .wrap(Wrap { trim: true }),
@@ -443,8 +618,8 @@ fn render_loading(app: &App, f: &mut Frame, area: Rect) {
     }
 
     f.render_widget(
-        Paragraph::new(step_lines(app, rows[4].width)).wrap(Wrap { trim: false }),
-        rows[4],
+        Paragraph::new(step_lines(app, rows[5].width)).wrap(Wrap { trim: false }),
+        rows[5],
     );
 }
 
@@ -502,7 +677,15 @@ fn render_prompt(app: &App, f: &mut Frame, area: Rect) {
     let theme = app.theme;
     let focused = app.menu_focus == MenuFocus::Prompt;
     let empty = app.prompt.is_empty();
-    let (text, fg) = if empty && !focused {
+    // The shell option takes no prompt, so the box explains itself instead of
+    // taking dictation. Any draft stays in `app.prompt`, hidden until the
+    // cycle moves back to a real agent.
+    let (text, fg) = if app.shell_selected() {
+        (
+            "A plain shell on the agent — no prompt, enter to launch".to_string(),
+            theme.dim,
+        )
+    } else if empty && !focused {
         (
             "Fix a bug, scaffold a service, explain a repo…".to_string(),
             theme.dim,
@@ -515,15 +698,15 @@ fn render_prompt(app: &App, f: &mut Frame, area: Rect) {
 
     // Only the harness. Where it lands is on its own line under the cards —
     // it changes rarely, and it was crowding the one control being used.
-    let count = if empty {
+    let count = if empty || app.shell_selected() {
         String::new()
     } else {
         format!(" {} ", app.prompt.chars().count())
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+    f.render_widget(Clear, area);
+
+    let block = dialog_block(theme)
         .border_style(Style::default().fg(if focused {
             theme.accent
         } else {
@@ -551,8 +734,8 @@ fn render_prompt(app: &App, f: &mut Frame, area: Rect) {
     // Keep the cursor line in view once the wrapped text outgrows the box.
     // Without this the box simply stops showing what is being typed, which is
     // the one thing it exists to do.
-    let inner_w = area.width.saturating_sub(2).max(1) as usize;
-    let inner_h = area.height.saturating_sub(2).max(1) as usize;
+    let inner_w = area.width.saturating_sub(DIALOG_CHROME_X).max(1) as usize;
+    let inner_h = area.height.saturating_sub(DIALOG_CHROME_Y).max(1) as usize;
     let scroll_y = wrapped_lines(&text, inner_w).saturating_sub(inner_h) as u16;
 
     f.render_widget(
@@ -768,22 +951,25 @@ pub fn session_pane_size(
     maximized: bool,
 ) -> Option<(u16, u16)> {
     let area = area?;
+    // The same inset the renderer applies — see `page_size` for why the two
+    // must never disagree.
+    let (width, height) = page_size(area.width, area.height);
     // Maximized there is no tree to leave room for, so no minimum width to
     // meet either.
-    if !maximized && area.width < 70 {
+    if !maximized && width < 70 {
         return None;
     }
     // Rows: header, gap, panes, hint. Columns: the tree, then what is left.
     // Both minus the pane's own border.
-    let rows = area.height.saturating_sub(3).saturating_sub(2).max(1);
+    let rows = height.saturating_sub(3).saturating_sub(2).max(1);
     let tree = if maximized { 0 } else { TREE_W };
-    let cols = area.width.saturating_sub(tree).saturating_sub(2).max(1);
+    let cols = width.saturating_sub(tree).saturating_sub(2).max(1);
     Some((rows, cols))
 }
 
 fn render_manage(app: &App, f: &mut Frame, rects: &mut PaneRects) {
     let theme = app.theme;
-    let area = f.area();
+    let area = page(f);
     let chunks = Layout::vertical([
         Constraint::Length(1), // header
         Constraint::Length(1), // gap
@@ -820,7 +1006,7 @@ fn render_manage(app: &App, f: &mut Frame, rects: &mut PaneRects) {
     // whitespace.
     // ⌥f hands the whole width to the session: the tree is navigation, and
     // once you are working in a session there is nothing to navigate.
-    let full = app.maximized && app.active_session().is_some();
+    let full = app.pane_is_full();
     let two_pane = !full && chunks[2].width >= 70;
     let panes = if two_pane {
         Layout::horizontal([Constraint::Length(TREE_W), Constraint::Min(20)]).split(chunks[2])
@@ -834,7 +1020,11 @@ fn render_manage(app: &App, f: &mut Frame, rects: &mut PaneRects) {
         rects.session_outer = whole(pane);
         rects.tree = PaneBox::default();
         rects.tree_outer = PaneBox::default();
-        if let Some(session) = app.active_session() {
+        // Same order as the two-pane branch: a launch in flight owns the pane
+        // until it produces the session that replaces it.
+        if app.loading.active {
+            render_loading(app, f, pane);
+        } else if let Some(session) = app.active_session() {
             render_session(app, session, f, pane);
         }
         render_manage_footer(app, f, chunks[3], rects);
@@ -864,7 +1054,10 @@ fn render_manage(app: &App, f: &mut Frame, rects: &mut PaneRects) {
                     } else {
                         theme.accent_dim
                     }))
-                    .title(Span::styled(" projects ", Style::default().fg(theme.dim))),
+                    .title(Span::styled(
+                        " cloud agents ",
+                        Style::default().fg(theme.dim),
+                    )),
             )
             .highlight_style(
                 Style::default()
@@ -883,28 +1076,37 @@ fn render_manage(app: &App, f: &mut Frame, rects: &mut PaneRects) {
         // What the right pane shows follows the selection, not merely whether a
         // session happens to be open: standing on an agent should show that
         // agent's cards even while one of its sessions is running in the
-        // background. Typing in a session is the exception — the pane it has
+        // background, and standing on a session that has no pane must not keep
+        // showing whichever pane was connected last — it gets a card saying
+        // so instead. Typing in a session is the exception — the pane it has
         // the keyboard in cannot vanish from under it.
+        let selected_kind = app.selected_row().map(|row| row.kind);
         let show_session = app.focus == ManageFocus::Session
-            || matches!(
-                app.selected_row().map(|row| row.kind),
-                Some(RowKind::Session(..))
-            );
+            || selected_kind.is_some_and(|kind| {
+                matches!(kind, RowKind::Session(..)) && app.pane_for_row(kind).is_some()
+            });
         if app.loading.active {
             render_loading(app, f, panes[1]);
         } else {
             match app.active_session().filter(|_| show_session) {
                 Some(session) => render_session(app, session, f, panes[1]),
-                None => f.render_widget(
-                    Paragraph::new(detail_lines(app)).block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(theme.accent_dim))
-                            .title(Span::styled(" agent ", Style::default().fg(theme.dim))),
-                    ),
-                    panes[1],
-                ),
+                None => {
+                    let title = if matches!(selected_kind, Some(RowKind::Session(..))) {
+                        " session "
+                    } else {
+                        " agent "
+                    };
+                    f.render_widget(
+                        Paragraph::new(detail_lines(app)).block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_type(BorderType::Rounded)
+                                .border_style(Style::default().fg(theme.accent_dim))
+                                .title(Span::styled(title, Style::default().fg(theme.dim))),
+                        ),
+                        panes[1],
+                    )
+                }
             }
         }
     }
@@ -967,25 +1169,35 @@ fn render_manage_footer(app: &App, f: &mut Frame, area: Rect, rects: &PaneRects)
     let sleeping = app
         .selected_agent_status()
         .is_some_and(|status| status != "running");
-    let hint: Vec<(&str, &str)> = if app.maximized {
-        vec![
-            ("⌥f", "restore the tree"),
-            ("shift+esc / ^]", "stop typing"),
-        ]
+    let hint: Vec<(&str, &str)> = if app.pane_is_full() {
+        vec![("⌥f", "restore the tree"), ("⌥/⇧esc / ^]", "stop typing")]
     } else if app.focus == ManageFocus::Session {
-        let mut keys = vec![("shift+esc / ^]", "stop typing"), ("⌥f", "maximize")];
-        // The agent is taking the clicks, so say how to take one back — this is
-        // the terminal's own convention, but nobody guesses it.
-        if app.active_session().is_some_and(|s| s.wants_mouse()) {
-            keys.push(("shift+drag", "select"));
+        // A dead pane's keys are recovery, not typing — the hint has to say
+        // so, or "stop typing" advertises an input nothing is reading.
+        if app
+            .active_session()
+            .is_some_and(|s| s.ended() || s.stalled())
+        {
+            vec![
+                ("r", "reconnect"),
+                ("x", "close pane"),
+                ("esc", "back to the tree"),
+            ]
+        } else {
+            let mut keys = vec![("⌥/⇧esc / ^]", "stop typing"), ("⌥f", "maximize")];
+            // The agent is taking the clicks, so say how to take one back — this is
+            // the terminal's own convention, but nobody guesses it.
+            if app.active_session().is_some_and(|s| s.wants_mouse()) {
+                keys.push(("shift+drag", "select"));
+            }
+            keys
         }
-        keys
     } else {
         match app.selected_row().map(|r| r.kind) {
             Some(RowKind::Session(..)) => vec![
                 ("enter", "connect"),
                 ("⌥f", "maximize"),
-                ("shift+enter", "full screen"),
+                ("⌥enter", "full screen"),
                 ("c", "copy ssh"),
                 ("x", "end session"),
                 if sleeping {
@@ -1005,9 +1217,18 @@ fn render_manage_footer(app: &App, f: &mut Frame, area: Rect, rects: &PaneRects)
                 },
                 ("d", "delete agent"),
             ],
+            // A group is a place, not a thing to open: the keys that matter
+            // are the ones that act on the environment it stands for.
+            Some(RowKind::Group(..)) => vec![
+                ("n", "new agent here"),
+                ("t", "target"),
+                ("⌥r", "refresh"),
+                ("shift+r", "find agents"),
+            ],
             _ => vec![
                 ("enter", "open"),
                 ("n", "new agent"),
+                ("⌥r", "refresh"),
                 ("shift+r", "find agents"),
             ],
         }
@@ -1016,7 +1237,7 @@ fn render_manage_footer(app: &App, f: &mut Frame, area: Rect, rects: &PaneRects)
     // pane the chord is a no-op and the hint would just be a lie.
     let mut hint = hint;
     if app.sessions.len() > 1 {
-        hint.push(("⌥]", "next session"));
+        hint.push(("⌥[ ⌥]", "switch session"));
     }
     let spans = chord_spans(theme, &hint);
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1071,21 +1292,17 @@ fn render_panel(f: &mut Frame, theme: &Theme, area: Rect, panel: Panel) {
         .sum::<usize>() as u16;
     // No progress dots means no row held open for them.
     let dots_h = u16::from(panel.position.is_some());
-    let width = 66.min(area.width.saturating_sub(4));
-    let height = (body_h + dots_h + 7).min(area.height.saturating_sub(2));
+    let width = (62 + DIALOG_CHROME_X).min(area.width.saturating_sub(4));
+    let height = (body_h + dots_h + 5 + DIALOG_CHROME_Y).min(area.height.saturating_sub(2));
     let outer = centered(width, height, area);
     f.render_widget(Clear, outer);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme.accent))
-        .title(Span::styled(
-            format!(" {} ", panel.title),
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = dialog_block(theme).title(Span::styled(
+        format!(" {} ", panel.title),
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    ));
     let inner = block.inner(outer);
     f.render_widget(block, outer);
 
@@ -1126,12 +1343,29 @@ fn render_panel(f: &mut Frame, theme: &Theme, area: Rect, panel: Panel) {
         );
     }
 
+    // The card clamps to the terminal, so a long list (a real account's
+    // projects) can hold more rows than the body has lines. Window the rows
+    // to keep the cursor visible: walk the start of the window forward until
+    // everything from there through the cursor fits.
+    let avail = rows[3].height as usize;
+    let row_height = |row: &PanelRow| if row.detail.is_empty() { 1 } else { 2 };
+    let mut first = 0usize;
+    while first < panel.cursor
+        && panel.rows[first..=panel.cursor.min(panel.rows.len() - 1)]
+            .iter()
+            .map(row_height)
+            .sum::<usize>()
+            > avail
+    {
+        first += 1;
+    }
+
     let mut lines: Vec<Line> = Vec::with_capacity(panel.rows.len() * 2);
-    for (i, row) in panel.rows.iter().enumerate() {
+    for (i, row) in panel.rows.iter().enumerate().skip(first) {
         let on = i == panel.cursor;
         let mut spans = vec![
             Span::styled(
-                if on { " ▌ " } else { "   " },
+                if on { "▌ " } else { "  " },
                 Style::default().fg(theme.accent),
             ),
             Span::styled(
@@ -1148,7 +1382,9 @@ fn render_panel(f: &mut Frame, theme: &Theme, area: Rect, panel: Panel) {
         if !row.tag.is_empty() {
             spans.push(Span::styled(
                 format!("  {}", row.tag),
-                Style::default().fg(theme.dim),
+                // The tag steps forward with its row: on the settings card it
+                // is the current value, which is the thing being changed.
+                Style::default().fg(if on { theme.fg } else { theme.dim }),
             ));
         }
         lines.push(Line::from(spans));
@@ -1156,7 +1392,7 @@ fn render_panel(f: &mut Frame, theme: &Theme, area: Rect, panel: Panel) {
         // a list of names into a list with gaps in it.
         if !row.detail.is_empty() {
             lines.push(Line::from(Span::styled(
-                format!("     {}", row.detail),
+                format!("  {}", row.detail),
                 Style::default().fg(theme.dim),
             )));
         }
@@ -1206,13 +1442,105 @@ fn render_wizard(app: &App, f: &mut Frame) {
     render_panel(
         f,
         theme,
-        f.area(),
+        page(f),
         Panel {
             title: "setup",
             heading: wizard.title(),
             position: wizard.position(),
             rows: &rows,
             cursor: wizard.cursor,
+            footer,
+        },
+    );
+}
+
+/// The ⌥s settings card: every preference with its current value beside it,
+/// or the project sub-picker while it is open.
+fn render_settings(app: &App, f: &mut Frame) {
+    let Some(settings) = app.settings.as_ref() else {
+        return;
+    };
+    let theme = app.theme;
+
+    // The sub-picker replaces the card wholesale, like a wizard step.
+    if let Some(pick) = settings.pick {
+        let rows: Vec<PanelRow> = settings
+            .picker_options()
+            .into_iter()
+            .map(|(label, tag, detail)| PanelRow { label, tag, detail })
+            .collect();
+        let footer = if let Some(busy) = settings.busy.as_deref() {
+            Line::from(vec![
+                Span::styled(
+                    format!("{} ", spinner_frame(app.loading.tick)),
+                    Style::default().fg(theme.accent),
+                ),
+                Span::styled(busy.to_string(), Style::default().fg(theme.fg)),
+            ])
+        } else if let Some(error) = settings.error.as_deref() {
+            Line::from(Span::styled(
+                format!("  {error}"),
+                Style::default().fg(theme.pending),
+            ))
+        } else {
+            Line::from(chord_spans(
+                theme,
+                &[("↑↓", "choose"), ("enter", "set default"), ("esc", "back")],
+            ))
+        };
+        render_panel(
+            f,
+            theme,
+            page(f),
+            Panel {
+                title: "settings",
+                heading: "Where should agents live?",
+                position: None,
+                rows: &rows,
+                cursor: pick,
+                footer,
+            },
+        );
+        return;
+    }
+
+    let cycles = settings.cycles();
+    let rows: Vec<PanelRow> = settings
+        .options()
+        .into_iter()
+        .enumerate()
+        .map(|(i, (label, value, detail))| PanelRow {
+            // Padded so the values read as a column.
+            label: format!("{label:<19}"),
+            // The highlighted value grows arrows when ←/→ changes it in
+            // place — the hint that this row edits right here.
+            tag: if i == settings.cursor && cycles {
+                format!("‹ {value} ›")
+            } else {
+                value
+            },
+            detail,
+        })
+        .collect();
+    let footer = Line::from(chord_spans(
+        theme,
+        &[
+            ("↑↓", "choose"),
+            ("←→", "change"),
+            ("enter", "edit"),
+            ("esc", "close"),
+        ],
+    ));
+    render_panel(
+        f,
+        theme,
+        page(f),
+        Panel {
+            title: "settings",
+            heading: "Cloud agent settings",
+            position: None,
+            rows: &rows,
+            cursor: settings.cursor,
             footer,
         },
     );
@@ -1246,7 +1574,7 @@ fn render_agent_pick(app: &App, f: &mut Frame) {
     render_panel(
         f,
         theme,
-        f.area(),
+        page(f),
         Panel {
             title: "new session",
             heading: "Which cloud agent?",
@@ -1255,6 +1583,114 @@ fn render_agent_pick(app: &App, f: &mut Frame) {
             cursor: picker.cursor,
             footer,
         },
+    );
+}
+
+/// ⌥n's picker: which agent runs the new session. The wizard's agent step,
+/// floated over the tree the launch is aimed at.
+fn render_harness_pick(app: &App, f: &mut Frame) {
+    let Some(cursor) = app.harness_pick else {
+        return;
+    };
+    let theme = app.theme;
+    let rows: Vec<PanelRow> = crate::commands::cloud_agent::tui::app::HARNESSES
+        .iter()
+        .map(|slug| PanelRow {
+            label: (*slug).to_string(),
+            tag: String::new(),
+            detail: super::wizard::harness_blurb(slug).to_string(),
+        })
+        .collect();
+    let footer = Line::from(chord_spans(
+        theme,
+        &[
+            ("↑↓", "choose"),
+            ("enter", "new session"),
+            ("esc", "cancel"),
+        ],
+    ));
+
+    render_panel(
+        f,
+        theme,
+        page(f),
+        Panel {
+            title: "new session",
+            heading: "Which agent should run it?",
+            position: None,
+            rows: &rows,
+            cursor,
+            footer,
+        },
+    );
+}
+
+/// ⌥p's composer: the menu's prompt box, floated over the tree so a new
+/// request doesn't cost the walk back to the menu.
+fn render_manage_prompt(app: &App, f: &mut Frame) {
+    let Some(draft) = app.manage_prompt.as_ref() else {
+        return;
+    };
+    let theme = app.theme;
+    let area = page(f);
+    // The same box as the main screen's prompt, so composing a session here
+    // feels like the same act there.
+    let (w, h) = prompt_box_size(area);
+    let outer = centered(w, h, area);
+    f.render_widget(Clear, outer);
+
+    let block = dialog_block(theme)
+        .title(Span::styled(
+            " New Session ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(vec![
+            Span::styled(
+                format!(" {} ", app.harness_name()),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("shift+tab ", Style::default().fg(theme.dim)),
+        ]))
+        .title_bottom(
+            Line::from(Span::styled(
+                if app.shell_selected() {
+                    " enter launch · esc close "
+                } else {
+                    " enter send · esc close "
+                },
+                Style::default().fg(theme.dim),
+            ))
+            .right_aligned(),
+        );
+
+    // The menu box's shell contract, here too: the box explains itself
+    // instead of taking dictation, and the draft waits out of sight.
+    let (text, fg) = if app.shell_selected() {
+        (
+            "A plain shell on the agent — no prompt, enter to launch".to_string(),
+            theme.dim,
+        )
+    } else {
+        (format!("{draft}▏"), theme.fg)
+    };
+    // Keep the cursor line in view once the wrapped text outgrows the box,
+    // same as the menu's prompt. The padding is chrome, not writing room, so
+    // it comes off the width and the height the text gets.
+    let inner_w = outer.width.saturating_sub(DIALOG_CHROME_X).max(1) as usize;
+    let inner_h = outer.height.saturating_sub(DIALOG_CHROME_Y).max(1) as usize;
+    let scroll_y = wrapped_lines(&text, inner_w).saturating_sub(inner_h) as u16;
+
+    f.render_widget(
+        Paragraph::new(text)
+            .block(block)
+            .style(Style::default().fg(fg))
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .scroll((scroll_y, 0)),
+        outer,
     );
 }
 
@@ -1289,7 +1725,7 @@ fn render_target_pick(app: &App, f: &mut Frame) {
     render_panel(
         f,
         theme,
-        f.area(),
+        page(f),
         Panel {
             title: "target",
             heading: "Where should Cloud Agents run?",
@@ -1305,7 +1741,7 @@ fn render_target_pick(app: &App, f: &mut Frame) {
 /// mode: the next keypress dismisses it.
 fn render_keys(app: &App, f: &mut Frame) {
     let theme = app.theme;
-    let area = f.area();
+    let area = page(f);
 
     let chord_w = KEY_HELP
         .iter()
@@ -1318,7 +1754,7 @@ fn render_keys(app: &App, f: &mut Frame) {
             lines.push(Line::from(""));
         }
         lines.push(Line::from(Span::styled(
-            format!(" {group}"),
+            (*group).to_string(),
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
@@ -1326,7 +1762,7 @@ fn render_keys(app: &App, f: &mut Frame) {
         for (chord, what) in *keys {
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("  {chord:>chord_w$}  "),
+                    format!("{chord:>chord_w$}  "),
                     Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled((*what).to_string(), Style::default().fg(theme.dim)),
@@ -1334,16 +1770,20 @@ fn render_keys(app: &App, f: &mut Frame) {
         }
     }
 
-    let width = 52.min(area.width.saturating_sub(4));
-    let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let rows = lines.len() as u16;
+    // As wide as the widest line it has to carry, so nothing gets truncated.
+    let content_w = lines
+        .iter()
+        .map(|line| line.width() as u16)
+        .max()
+        .unwrap_or(48);
+    let width = (content_w + DIALOG_CHROME_X).min(area.width.saturating_sub(4));
+    let height = (rows + DIALOG_CHROME_Y).min(area.height.saturating_sub(2));
     let panel = centered(width, height, area);
     f.render_widget(Clear, panel);
     f.render_widget(
         Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.accent))
+            dialog_block(theme)
                 .title(Span::styled(
                     " keys ",
                     Style::default()
@@ -1387,7 +1827,17 @@ fn render_session(app: &App, session: &super::session::Session, f: &mut Frame, a
         // strip at the bottom of the screen already has it.
         .title_bottom(Line::from(Span::styled(
             if session.ended() {
-                " session ended "
+                // The keys differ by focus: r/x are the pane's own, enter is
+                // the tree's. Advertising the wrong set would send keystrokes
+                // into the tree — or worse, `x` into a session row, which
+                // kills the session on the agent.
+                if focused {
+                    " connection closed · r reconnects · x closes "
+                } else {
+                    " connection closed · enter on its row reconnects "
+                }
+            } else if session.stalled() {
+                " no response "
             } else if session.scrolled_back() {
                 " scrolled back · type to return "
             } else if !session.scrollable() {
@@ -1402,6 +1852,28 @@ fn render_session(app: &App, session: &super::session::Session, f: &mut Frame, a
 
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    // An attach gone silent has nothing to draw, so say what the silence
+    // means instead of showing an empty screen. The platform can list a
+    // session as running after its agent slept killed the process; attaching
+    // to that name streams nothing, ever.
+    if session.stalled() {
+        let dim = Style::default().fg(theme.dim);
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled("Nothing has arrived from this session.", dim)),
+                Line::from(Span::styled(
+                    "It may have ended when the agent last slept —",
+                    dim,
+                )),
+                Line::from(Span::styled("r dials it again, x closes this pane.", dim)),
+            ])
+            .alignment(ratatui::layout::Alignment::Center),
+            inner,
+        );
+        return;
+    }
 
     let Some(lines) = session.with_screen(|screen| screen_lines(screen, focused)) else {
         return;
@@ -1421,11 +1893,24 @@ fn screen_lines(screen: &vt100::Screen, focused: bool) -> Vec<Line<'static>> {
         let mut run_style: Option<Style> = None;
 
         for col in 0..cols {
+            // A wide character's second cell: the glyph already spans both
+            // columns when drawn, so a space here would shift the rest of
+            // the line right by one column per wide character.
+            if screen
+                .cell(row, col)
+                .is_some_and(vt100::Cell::is_wide_continuation)
+            {
+                continue;
+            }
             let (text, mut style) = match screen.cell(row, col) {
                 Some(cell) => (
                     {
                         let c = cell.contents();
-                        if c.is_empty() { " ".to_string() } else { c }
+                        if c.is_empty() {
+                            " ".to_string()
+                        } else {
+                            c.to_string()
+                        }
                     },
                     cell_style(cell),
                 ),
@@ -1468,6 +1953,11 @@ fn cell_style(cell: &vt100::Cell) -> Style {
     }
     if cell.bold() {
         style = style.add_modifier(Modifier::BOLD);
+    }
+    // Claude Code's ghost text — the follow-up prompt → fills in — is plain
+    // SGR 2, no colour of its own; dropping dim renders it as ordinary text.
+    if cell.dim() {
+        style = style.add_modifier(Modifier::DIM);
     }
     if cell.italic() {
         style = style.add_modifier(Modifier::ITALIC);
@@ -1566,7 +2056,7 @@ fn tree_line(theme: &Theme, row: &Row) -> Line<'static> {
             "─".repeat(TREE_W.saturating_sub(4) as usize),
             Style::default().fg(theme.accent_dim),
         )),
-        (RowKind::Note(..), _) => spans.push(Span::styled(
+        (RowKind::Note(..) | RowKind::Hint, _) => spans.push(Span::styled(
             row.label.clone(),
             Style::default()
                 .fg(theme.dim)
@@ -1588,6 +2078,9 @@ fn tree_line(theme: &Theme, row: &Row) -> Line<'static> {
                 RowKind::Workspace(_) => Style::default()
                     .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
+                // A group heads its agents the way a workspace used to head
+                // everything: bold, so the sections read at a glance.
+                RowKind::Group(..) => Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
                 _ => Style::default().fg(theme.fg),
             };
             spans.push(Span::styled(row.label.clone(), style));
@@ -1718,7 +2211,7 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
             }
             lines
         }
-        RowKind::Environment(w, p, e) => {
+        RowKind::Environment(w, p, e) | RowKind::Group(w, p, e) => {
             let proj = &app.tree[w].projects[p];
             let env = &proj.envs[e];
             let count = match &env.agents {
@@ -1779,11 +2272,8 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
             ))];
             // The command lives here, not in the row: it is a whole launch
             // line, and this is the pane with room for it.
-            if let Load::Loaded(agents) = &app.tree[w].projects[p].envs[e].agents
-                && let Some(agent) = agents.get(a)
-                && let LoadSessions::Loaded(sessions) = &agent.sessions
-                && let Some(session) = sessions.get(i)
-            {
+            let session = app.console_session(w, p, e, a, i);
+            if let Some(session) = session {
                 lines.push(Line::from(""));
                 lines.push(kv(
                     "state",
@@ -1797,13 +2287,51 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
                 )));
             }
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                " enter reattaches in the pane",
-                Style::default().fg(theme.dim),
-            )));
+            // This card only shows for a session without a pane (one with a
+            // pane shows the pane itself), so say that plainly, and say how
+            // to get the pane back — via a wake first when the agent is
+            // asleep, since a reattach to a sleeping agent is refused.
+            let connected = session
+                .is_some_and(|s| app.sessions.iter().any(|pane| pane.durable_name == s.name));
+            if connected {
+                lines.push(Line::from(Span::styled(
+                    " enter puts the keyboard in its pane",
+                    Style::default().fg(theme.dim),
+                )));
+            } else {
+                let sleeping = app
+                    .selected_agent_status()
+                    .is_some_and(|status| status != "running");
+                lines.push(Line::from(Span::styled(
+                    " not connected — its output isn't shown here",
+                    Style::default().fg(theme.pending),
+                )));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    if sleeping {
+                        " w wakes the agent, then enter reconnects"
+                    } else {
+                        " enter reconnects · c copies the ssh command"
+                    },
+                    Style::default().fg(theme.dim),
+                )));
+            }
             lines
         }
-        RowKind::Separator | RowKind::Note(..) => vec![Line::from("")],
+        RowKind::OtherProjects => vec![
+            Line::from(Span::styled(
+                " projects without agents",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                " open one and press n to start an agent there",
+                Style::default().fg(theme.dim),
+            )),
+        ],
+        RowKind::Separator | RowKind::Note(..) | RowKind::Hint => vec![Line::from("")],
     }
 }
 
@@ -1818,6 +2346,7 @@ mod tests {
 
     pub(super) fn app_with_tree() -> App {
         let tree = vec![WorkspaceNode {
+            id: "ws_1".into(),
             name: "Railway".into(),
             expanded: true,
             projects: vec![ProjectNode {
@@ -1869,6 +2398,206 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Every cell of a drawn frame, as `(symbol, background)`.
+    fn cells(app: &App, w: u16, h: u16) -> Vec<Vec<(String, Color)>> {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|f| {
+                render_with_layout(app, f);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| {
+                        let cell = &buffer[(x, y)];
+                        (cell.symbol().to_string(), cell.bg)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The rows a dialog covers, found by its border corners: the first row
+    /// holding `╭` at or after `title`, through the matching `╰`.
+    fn dialog_rows(grid: &[Vec<(String, Color)>], title: &str) -> (usize, usize, usize, usize) {
+        let top = grid
+            .iter()
+            .position(|row| {
+                let line: String = row.iter().map(|(s, _)| s.as_str()).collect();
+                line.contains('╭') && line.contains(title)
+            })
+            .unwrap_or_else(|| panic!("no dialog titled {title}"));
+        let left = grid[top].iter().position(|(s, _)| s == "╭").unwrap();
+        let right = grid[top].iter().rposition(|(s, _)| s == "╮").unwrap();
+        let bottom = (top + 1..grid.len())
+            .find(|y| grid[*y][left].0 == "╰")
+            .expect("a closed dialog");
+        (top, bottom, left, right)
+    }
+
+    /// A dialog is a surface, not a window onto the screen behind it: every
+    /// cell it covers carries its own background, so nothing underneath and no
+    /// terminal wallpaper shows through.
+    #[test]
+    fn dialogs_are_filled_rather_than_transparent() {
+        let mut app = app_with_tree();
+        app.start_settings();
+        let grid = cells(&app, 100, 40);
+        let (top, bottom, left, right) = dialog_rows(&grid, "settings");
+        let surface = app.theme.surface;
+        for row in &grid[top..=bottom] {
+            for (symbol, bg) in &row[left..=right] {
+                // The key badges in the footer paint their own background;
+                // everything else is the surface.
+                assert!(
+                    *bg == surface || *bg == app.theme.accent_dim,
+                    "transparent cell {symbol:?} in the dialog: {bg:?}"
+                );
+            }
+        }
+    }
+
+    /// The breathing room lives outside the boxes: a slim margin of untouched
+    /// cells between the terminal's edges and everything the TUI draws, on
+    /// every screen.
+    #[test]
+    fn the_page_keeps_clear_of_the_terminal_edges() {
+        for screen in [Screen::Menu, Screen::Manage] {
+            let mut app = app_with_tree();
+            app.screen = screen;
+            let grid = cells(&app, 100, 40);
+            let blank = |cells: &[(String, Color)]| cells.iter().all(|(s, _)| s == " ");
+            let h = grid.len();
+            for y in 0..PAGE_MARGIN_Y as usize {
+                assert!(blank(&grid[y]), "top margin row {y} has content");
+                assert!(blank(&grid[h - 1 - y]), "bottom margin row has content");
+            }
+            for (y, row) in grid.iter().enumerate() {
+                let w = row.len();
+                assert!(
+                    blank(&row[..PAGE_MARGIN_X as usize]),
+                    "left margin has content at row {y}"
+                );
+                assert!(
+                    blank(&row[w - PAGE_MARGIN_X as usize..]),
+                    "right margin has content at row {y}"
+                );
+            }
+        }
+    }
+
+    /// The last row the TUI actually draws on — the footer/key strip sits
+    /// here, one page margin above the terminal's bottom edge.
+    pub(super) fn last_drawn_line(out: &str) -> String {
+        out.lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The menu prompt holds a paragraph's worth of writing room — six text
+    /// rows inside the outline — and its breathing room sits outside the box:
+    /// blank rows against the border, not padding within it.
+    #[test]
+    fn the_menu_prompt_is_tall_with_its_room_outside() {
+        let app = app_with_tree();
+        let out = draw(&app, 100, 40);
+        let lines: Vec<&str> = out.lines().collect();
+        let top = lines
+            .iter()
+            .position(|l| l.contains(" Prompt "))
+            .expect("the prompt box");
+        let bottom = (top + 1..lines.len())
+            .find(|&y| lines[y].trim_start().starts_with("╰"))
+            .expect("the prompt's bottom border");
+        assert_eq!(bottom - top, 7, "six text rows inside the outline:\n{out}");
+        for y in [top - 1, bottom + 1] {
+            assert!(
+                lines[y].trim().is_empty(),
+                "row {y} should be the prompt's outside gap: {:?}",
+                lines[y]
+            );
+        }
+    }
+
+    /// The ⌥p composer is the main screen's prompt box opened elsewhere —
+    /// same width, same height — so it reads as the same control.
+    #[test]
+    fn the_composer_matches_the_menu_prompt_box() {
+        fn box_of(out: &str, title: &str) -> (usize, usize) {
+            let lines: Vec<&str> = out.lines().collect();
+            let top = lines
+                .iter()
+                .position(|l| l.contains(title))
+                .unwrap_or_else(|| panic!("{title} not drawn"));
+            let row: Vec<char> = lines[top].chars().collect();
+            let left = row.iter().position(|&c| c == '╭').expect("a top border");
+            let right = row.iter().rposition(|&c| c == '╮').expect("a top border");
+            // The closing corner is found by column, not line start: the
+            // composer floats over the manage screen, whose pane borders own
+            // the starts of these rows.
+            let bottom = (top + 1..lines.len())
+                .find(|&y| lines[y].chars().nth(left) == Some('╰'))
+                .expect("a closed box");
+            (bottom - top + 1, right - left + 1)
+        }
+        let menu = box_of(&draw(&app_with_tree(), 100, 40), " Prompt ");
+        let mut app = app_with_tree();
+        app.screen = Screen::ManagePrompt;
+        app.manage_prompt = Some(String::new());
+        let composer = box_of(&draw(&app, 100, 40), " New Session ");
+        assert_eq!(menu, composer, "(height, width) of the two prompt boxes");
+    }
+
+    /// Submitting from the main screen carries the prompt box along: the
+    /// loading pane echoes it in the same box (title, dialog surface, shared
+    /// size rule), not a smaller "Task" card.
+    #[test]
+    fn the_loading_screen_echoes_the_prompt_in_its_own_box() {
+        use crate::commands::cloud_agent::tui::app::Loading;
+
+        let mut app = app_with_tree();
+        app.screen = Screen::Manage;
+        app.loading = Loading {
+            active: true,
+            target: "devtools/production".into(),
+            harness: "claude".into(),
+            prompt: Some("ship the release notes".into()),
+            steps: Vec::new(),
+            tick: 0,
+        };
+        let out = draw(&app, 100, 40);
+        assert!(out.contains(" Prompt "), "the box keeps its name:\n{out}");
+        assert!(!out.contains(" Task "), "the old card is gone:\n{out}");
+        assert!(out.contains("ship the release notes"), "{out}");
+
+        // A row of air separates the box from the steps below it.
+        let lines: Vec<&str> = out.lines().collect();
+        let top = lines.iter().position(|l| l.contains(" Prompt ")).unwrap();
+        let col = lines[top].chars().position(|c| c == '╭').unwrap();
+        let bottom = (top + 1..lines.len())
+            .find(|&y| lines[y].chars().nth(col) == Some('╰'))
+            .expect("a closed box");
+        let right = lines[top]
+            .chars()
+            .collect::<Vec<_>>()
+            .iter()
+            .rposition(|&c| c == '╮')
+            .expect("a top border");
+        let below: String = lines[bottom + 1]
+            .chars()
+            .skip(col)
+            .take(right - col + 1)
+            .collect();
+        assert!(
+            below.trim().is_empty(),
+            "the row under the prompt box should be clear: {below:?}"
+        );
     }
 
     /// The wordmark must be full blocks and spaces only: box-drawing shadow
@@ -1926,9 +2655,14 @@ mod tests {
             .rfind(|l| l.contains("launch"))
             .expect("the menu footer");
         assert!(footer.contains("enter"), "{footer}");
-        assert!(footer.contains("target"), "{footer}");
-        assert!(footer.contains("theme"), "{footer}");
-        assert!(footer.contains("setup"), "{footer}");
+        assert!(footer.contains("settings"), "{footer}");
+        assert!(
+            !footer.contains("theme"),
+            "the theme moved onto the settings card: {footer}"
+        );
+        // The target shortcut moved onto the target line itself — see
+        // `target_shortcut_sits_on_its_own_line`.
+        assert!(!footer.contains("target"), "{footer}");
         assert!(!footer.contains("menu"), "the arrow hint is gone: {footer}");
         // The old run-on line separated with interpuncts; the badges do not.
         assert!(!footer.contains(" · "), "{footer}");
@@ -1995,18 +2729,48 @@ mod tests {
         );
     }
 
-    /// Setup is on the menu only while there is nothing set up; after that it
-    /// is the ⌥s in the footer, which is there either way.
+    /// Setup is on the menu only while there is nothing set up; after that
+    /// the answers live behind the ⌥s in the footer, which is there either
+    /// way.
     #[test]
     fn setup_is_a_card_only_on_a_first_run() {
         let mut app = app_with_tree();
         let out = draw(&app, 100, 40);
         assert!(!out.contains("Default agent, skills"), "{out}");
-        assert!(out.contains("setup"), "the chord is still offered:\n{out}");
+        assert!(
+            out.contains("settings"),
+            "the chord is still offered:\n{out}"
+        );
 
         app.configured = false;
         let out = draw(&app, 100, 40);
         assert!(out.contains("Default agent, skills"), "{out}");
+    }
+
+    /// With shell selected the box stops being a prompt: it says what enter
+    /// does instead of inviting text, and hides a draft typed for a real
+    /// agent rather than showing words that would go nowhere.
+    #[test]
+    fn the_prompt_box_explains_itself_on_shell() {
+        let mut app = app_with_tree();
+        app.prompt = "fix the tests".into();
+        while app.harness_name() != "shell" {
+            app.on_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::BackTab,
+                crossterm::event::KeyModifiers::SHIFT,
+            ));
+        }
+        let out = draw(&app, 100, 40);
+        assert!(out.contains("A plain shell on the agent"), "{out}");
+        assert!(
+            !out.contains("fix the tests"),
+            "the hidden draft must not show through: {out}"
+        );
+        let footer = out
+            .lines()
+            .find(|l| l.contains("shell") && l.contains("shift+tab"))
+            .expect("the prompt box footer names the selection");
+        assert!(footer.contains("shell"), "{footer}");
     }
 
     /// Where the prompt lands is its own line above the keys, not a chip inside
@@ -2042,6 +2806,34 @@ mod tests {
             .position(|l| l.contains("launch"))
             .expect("the footer");
         assert!(target < footer, "the target sits above the shortcuts");
+    }
+
+    /// The shortcut for changing the target sits right on the field it acts
+    /// on, not lumped into the footer's own chord list where it read like a
+    /// command with no object.
+    #[test]
+    fn the_target_shortcut_sits_on_its_own_line() {
+        let app = app_with_tree();
+        let out = draw(&app, 100, 40);
+        let target = out
+            .lines()
+            .find(|l| l.contains("Target Project"))
+            .expect("the target indicator");
+        let chord_at = target.find("^t").expect("the chord badge: {target}");
+        let label_at = target.find("Target Project").unwrap();
+        assert!(
+            chord_at < label_at,
+            "the chord badge comes before the label: {target}"
+        );
+
+        let footer = out
+            .lines()
+            .rfind(|l| l.contains("settings"))
+            .expect("the menu footer");
+        assert!(
+            !footer.contains("^t"),
+            "the chord moved out of the footer: {footer}"
+        );
     }
 
     /// With nowhere to launch, the indicator says so rather than going blank.
@@ -2114,8 +2906,145 @@ mod tests {
         assert_eq!(rects.prompt.y as usize, prompt);
     }
 
+    /// The pane renders history from any depth, not just the last screenful.
+    /// This drives the real draw path — `render_session` → `screen_lines` →
+    /// `Screen::cell` — with the view sitting several screens back, which the
+    /// old emulator could not compose at all.
+    #[test]
+    fn a_deeply_scrolled_pane_draws_old_history() {
+        use crate::commands::cloud_agent::tui::session::Session;
+
+        let mut app = app_with_tree();
+        app.screen = Screen::Manage;
+        app.attach_session(
+            Session::for_test("ca_1", "nimble-otter").unwrap(),
+            "ca_1".into(),
+        );
+
+        let session = app.sessions.last_mut().expect("just attached");
+        session.resize(6, 40);
+        for i in 0..80 {
+            session.send(format!("line-{i}\r\n").as_bytes());
+        }
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let seen = session
+                .with_screen(|screen| screen.contents().contains("line-79"))
+                .unwrap_or(false);
+            if seen {
+                break;
+            }
+        }
+        session.scroll_by(isize::MAX);
+        assert!(session.scrolled_back());
+
+        let out = draw(&app, 92, 20);
+        assert!(
+            out.contains("line-0"),
+            "the top of history should be on screen:\n{out}"
+        );
+        assert!(
+            !out.contains("line-79"),
+            "the tail should be scrolled out of view:\n{out}"
+        );
+        assert!(
+            out.contains("scrolled back"),
+            "the pane should say where it is:\n{out}"
+        );
+    }
+
     /// A drag that reached the clipboard says so in the corner — the only other
     /// evidence is the clipboard itself, which is not on the screen.
+    /// The PTY and the drawn pane are the same size. An emulator wrapping
+    /// wider than its pane puts the tail of every row somewhere the screen
+    /// never shows — four characters per fold of anything long enough to
+    /// wrap, which sheared OAuth login URLs into invalid links.
+    #[test]
+    fn the_session_pty_matches_the_drawn_pane() {
+        use crate::commands::cloud_agent::tui::session::Session;
+
+        let mut app = app_with_tree();
+        app.screen = Screen::Manage;
+        app.attach_session(
+            Session::for_test("ca_1", "nimble-otter").unwrap(),
+            "ca_1".into(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        let mut rects = crate::commands::cloud_agent::tui::app::PaneRects::default();
+        terminal
+            .draw(|f| {
+                let (r, _) = render_with_layout(&app, f);
+                rects = r;
+            })
+            .unwrap();
+        let (rows, cols) =
+            session_pane_size(Some(ratatui::layout::Size::new(100, 40)), false).unwrap();
+        assert_eq!(
+            (cols, rows),
+            (rects.session.w, rects.session.h),
+            "the PTY must be exactly the pane the emulator is drawn into"
+        );
+    }
+
+    /// An error toast sits front and center at the bottom of the session
+    /// pane, where it can actually be read — not squeezed in beside the
+    /// wordmark like a piece of header furniture.
+    #[test]
+    fn an_error_toast_centers_over_the_session_pane() {
+        use crate::commands::cloud_agent::tui::session::Session;
+
+        let mut app = app_with_tree();
+        app.screen = Screen::Manage;
+        app.attach_session(
+            Session::for_test("ca_1", "nimble-otter").unwrap(),
+            "ca_1".into(),
+        );
+        app.toast_error("Launch failed: boom");
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut rects = crate::commands::cloud_agent::tui::app::PaneRects::default();
+        terminal
+            .draw(|f| {
+                let (r, _) = render_with_layout(&app, f);
+                rects = r;
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let out = (0..30)
+            .map(|y| {
+                (0..100)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines: Vec<&str> = out.lines().collect();
+        let row = lines
+            .iter()
+            .position(|l| l.contains("✕"))
+            .expect("the error toast");
+        assert!(row > lines.len() * 2 / 3, "near the bottom: {row}");
+        // Char positions, not byte offsets: the row is full of multi-byte
+        // box-drawing cells, and columns are what centering is measured in.
+        let line: Vec<char> = lines[row].chars().collect();
+        let needle: Vec<char> = "Launch failed: boom".chars().collect();
+        let start = line
+            .windows(needle.len())
+            .position(|w| w == needle.as_slice())
+            .expect("the reason");
+        let end = start + needle.len();
+        // Centered within the session pane the frame actually drew.
+        assert!(
+            start > rects.session.x as usize,
+            "inside the session pane: {start}"
+        );
+        let pane_mid = rects.session.x as usize + rects.session.w as usize / 2;
+        let toast_mid = (start + end) / 2;
+        assert!(
+            toast_mid.abs_diff(pane_mid) <= 3,
+            "centered in the pane: toast mid {toast_mid}, pane mid {pane_mid}\n{out}"
+        );
+    }
+
     #[test]
     fn a_toast_floats_in_the_bottom_corner() {
         use crate::commands::cloud_agent::tui::session::Session;
@@ -2146,15 +3075,26 @@ mod tests {
             .position(|w| w.iter().collect::<String>() == "Copied")
             .expect("the toast text");
         assert!(start > 92 / 2, "on the right: {start}");
+        let strip = last_drawn_line(&out);
         assert!(
-            lines[lines.len() - 1].contains("keys"),
-            "the key strip is untouched: {}",
-            lines[lines.len() - 1]
+            strip.contains("keys"),
+            "the key strip is untouched: {strip}"
+        );
+        // The toast is a closed box: its bottom border sits under the text
+        // (with the padding between them) and above the key strip.
+        let closed = (row + 1..lines.len())
+            .find(|y| lines[*y].contains("╰"))
+            .expect("the toast's bottom border");
+        assert!(
+            closed < lines.len() - 1,
+            "the toast should close above the key strip: {}",
+            lines[closed]
         );
         assert!(
-            lines[row + 1].contains("╰") && !lines[row + 1].contains("Copied"),
-            "the toast is closed above the pane border: {}",
-            lines[row + 1]
+            lines[row + 1..=closed]
+                .iter()
+                .all(|l| !l.contains("Copied")),
+            "the text is inside the box only once"
         );
     }
 
@@ -2200,11 +3140,11 @@ mod tests {
         let out = draw(&app, 92, 20);
         let border = out
             .lines()
-            .find(|l| l.starts_with("╰"))
+            .find(|l| l.trim_start().starts_with("╰"))
             .expect("the pane's bottom border");
         assert!(!border.contains("to leave"), "{border}");
         assert!(
-            out.lines().next_back().unwrap().contains("stop typing"),
+            last_drawn_line(&out).contains("stop typing"),
             "the key strip still has it:\n{out}"
         );
     }
@@ -2221,11 +3161,11 @@ mod tests {
             "ca_1".into(),
         );
         let before = draw(&app, 100, 30);
-        assert!(before.contains("projects"), "the tree is there first");
+        assert!(before.contains("cloud agents"), "the tree is there first");
 
         app.maximized = true;
         let out = draw(&app, 100, 30);
-        assert!(!out.contains(" projects "), "the tree is gone:\n{out}");
+        assert!(!out.contains(" cloud agents "), "the tree is gone:\n{out}");
         assert!(!out.contains("devtools"), "no tree rows:\n{out}");
         assert!(out.contains("restore the tree"), "the way back:\n{out}");
 
@@ -2237,8 +3177,8 @@ mod tests {
             .expect("the session pane");
         assert_eq!(
             pane.chars().position(|c| c == '╭'),
-            Some(0),
-            "the pane starts at the left edge: {pane}"
+            Some(PAGE_MARGIN_X as usize),
+            "the pane starts at the page's left edge: {pane}"
         );
     }
 
@@ -2252,8 +3192,9 @@ mod tests {
         });
         let (_, split) = session_pane_size(size, false).unwrap();
         let (_, full) = session_pane_size(size, true).unwrap();
-        assert_eq!(split, 100 - TREE_W - 2);
-        assert_eq!(full, 98);
+        // Inside the page margin, like the panes it must agree with.
+        assert_eq!(split, 100 - PAGE_MARGIN_X * 2 - TREE_W - 2);
+        assert_eq!(full, 100 - PAGE_MARGIN_X * 2 - 2);
 
         // And a terminal too narrow for two panes is wide enough for one.
         let narrow = Some(ratatui::layout::Size {
@@ -2384,7 +3325,8 @@ mod tests {
             .position(|r| r.label == "nimble-otter")
             .unwrap();
         let out = draw(&app, 100, 30);
-        assert!(out.contains("Railway"));
+        // The group header carries the project; the environment shows in the
+        // detail pane rather than as a level of its own.
         assert!(out.contains("devtools"));
         assert!(out.contains("production"));
         assert!(out.contains("nimble-otter"));
@@ -2467,6 +3409,7 @@ mod tests {
             harness: "claude".into(),
             prompt: Some("fix the failing tests".into()),
             label: "devtools/production".into(),
+            base: Default::default(),
         });
         app.loading_step("Creating a cloud agent".into());
 
@@ -2512,6 +3455,39 @@ mod tests {
         );
     }
 
+    /// …unless the tree was collapsed on the way in. `railway code` has
+    /// already answered where and which harness, so there is nothing to
+    /// navigate: the wait gets the whole window, and the session that replaces
+    /// it inherits the same shape rather than jumping a pane's width sideways
+    /// the moment it connects.
+    #[test]
+    fn a_collapsed_launch_gives_the_wait_the_whole_window() {
+        let mut app = app_with_tree();
+        app.maximized = true;
+        app.start_loading(&crate::commands::cloud_agent::tui::LaunchRequest {
+            project_id: "proj_1".into(),
+            environment_id: "env_prod".into(),
+            agent_id: None,
+            session_name: None,
+            force_new: false,
+            new_session: false,
+            harness: "claude".into(),
+            prompt: None,
+            label: "devtools/production".into(),
+            base: Default::default(),
+        });
+        app.loading_step("Creating a cloud agent".into());
+
+        let out = draw(&app, 100, 30);
+        assert!(out.contains("Creating a cloud agent"), "steps:\n{out}");
+        assert!(
+            !out.contains("cloud agents "),
+            "the tree pane's title should be gone:\n{out}"
+        );
+        // ⌥f is how it comes back, and the footer has to say so.
+        assert!(out.contains("restore the tree"), "footer:\n{out}");
+    }
+
     /// The footer carries the actions that apply where the cursor is, with help
     /// pinned right; everything else is behind `?`.
     #[test]
@@ -2525,7 +3501,8 @@ mod tests {
             .unwrap();
 
         let out = draw(&app, 120, 30);
-        let footer = out.lines().last().unwrap();
+        let footer = last_drawn_line(&out);
+        let footer = footer.as_str();
         assert!(footer.contains("connect"), "{footer}");
         assert!(footer.contains("new session"), "{footer}");
         assert!(footer.contains("delete agent"), "{footer}");
@@ -2555,7 +3532,7 @@ mod tests {
             .position(|r| r.label == "nimble-otter")
             .unwrap();
 
-        let footer = draw(&app, 120, 30).lines().last().unwrap().to_string();
+        let footer = last_drawn_line(&draw(&app, 120, 30));
         assert!(footer.contains("wake"), "{footer}");
         assert!(!footer.contains("sleep"), "{footer}");
     }
@@ -2570,7 +3547,7 @@ mod tests {
             .iter()
             .position(|r| r.label == "devtools")
             .unwrap();
-        let footer = draw(&app, 120, 30).lines().last().unwrap().to_string();
+        let footer = last_drawn_line(&draw(&app, 120, 30));
         assert!(footer.contains("new agent"), "{footer}");
         assert!(!footer.contains("delete"), "{footer}");
         assert!(footer.trim_end().ends_with("keys"), "{footer}");
@@ -2582,10 +3559,12 @@ mod tests {
         let mut app = app_with_tree();
         app.screen = Screen::Manage;
         app.keys_open = true;
-        let out = draw(&app, 100, 30);
+        // Two rows taller than before: the page margin trims the overlay's
+        // room, and this list is exactly long enough to notice.
+        let out = draw(&app, 100, 34);
         assert!(out.contains("keys"));
         assert!(out.contains("refresh"), "{out}");
-        assert!(out.contains("shift+esc / ^]"), "{out}");
+        assert!(out.contains("⌥/⇧esc / ^]"), "{out}");
         assert!(out.contains("any key closes"));
     }
 
@@ -2643,6 +3622,60 @@ mod tests {
         );
     }
 
+    /// Standing on a session that has no pane says so and offers the way
+    /// back, instead of leaving whichever pane was connected last on screen.
+    #[test]
+    fn a_disconnected_session_says_so() {
+        let mut app = app_with_tree();
+        app.screen = Screen::Manage;
+        if let Load::Loaded(agents) = &mut app.tree[0].projects[0].envs[0].agents {
+            agents[0].expanded = true;
+            agents[0].sessions = LoadSessions::Loaded(vec![
+                crate::commands::cloud_agent::tui::app::ConsoleSession {
+                    name: "claude-one".into(),
+                    kind: "SHELL".into(),
+                    command: None,
+                    running: true,
+                    attached: true,
+                },
+                crate::commands::cloud_agent::tui::app::ConsoleSession {
+                    name: "claude-two".into(),
+                    kind: "SHELL".into(),
+                    command: None,
+                    running: true,
+                    attached: false,
+                },
+            ]);
+        }
+        // One pane is open, for the *other* session.
+        let mut pane =
+            crate::commands::cloud_agent::tui::session::Session::for_test("ca_1", "nimble-otter")
+                .unwrap();
+        pane.durable_name = "claude-one".into();
+        app.sessions = vec![pane];
+        app.active = Some(0);
+        app.focus = ManageFocus::Tree;
+        app.cursor = app
+            .rows()
+            .iter()
+            .position(|r| r.label == "claude-two")
+            .unwrap();
+
+        let out = draw(&app, 110, 30);
+        assert!(
+            !out.contains("nimble-otter · claude-one"),
+            "the other session's pane must not linger:\n{out}"
+        );
+        assert!(
+            out.contains("not connected"),
+            "the card says the session is disconnected:\n{out}"
+        );
+        assert!(
+            out.contains("enter reconnects"),
+            "the card says how to get it back:\n{out}"
+        );
+    }
+
     /// Typing past the bottom of the prompt scrolls it, rather than quietly
     /// hiding what is being typed.
     #[test]
@@ -2654,10 +3687,51 @@ mod tests {
             .repeat(3);
         let out = draw(&app, 100, 40);
         // The tail is what matters: the end of the draft has to be on screen.
+        // The last words rather than a whole phrase — the box wraps, and where
+        // a line breaks is the box's business.
         assert!(
-            out.contains("describing what changed"),
+            out.contains("what changed"),
             "the end of the prompt should be visible:\n{out}"
         );
+    }
+
+    /// Every text attribute the emulator tracks survives into the drawn
+    /// pane. Dim is the one that regressed: Claude Code's ghost text is
+    /// plain SGR 2 with no colour of its own, so dropping it rendered the
+    /// suggestion as ordinary text.
+    #[test]
+    fn emulator_attributes_reach_the_pane() {
+        let mut parser = vt100::Parser::new(4, 40, 0);
+        parser.process(b"plain \x1b[2mghost\x1b[22m \x1b[3mslant\x1b[23m \x1b[1mloud\x1b[22m");
+        let lines = screen_lines(parser.screen(), false);
+        let style_of = |word: &str| {
+            lines[0]
+                .spans
+                .iter()
+                .find(|span| span.content.contains(word))
+                .unwrap_or_else(|| panic!("{word} is on screen"))
+                .style
+        };
+        assert!(style_of("ghost").add_modifier.contains(Modifier::DIM));
+        assert!(style_of("slant").add_modifier.contains(Modifier::ITALIC));
+        assert!(style_of("loud").add_modifier.contains(Modifier::BOLD));
+        assert!(style_of("plain").add_modifier.is_empty());
+    }
+
+    /// A wide character owns two columns but is one glyph: its continuation
+    /// cell must not become a phantom space that shifts the rest of the line
+    /// right.
+    #[test]
+    fn wide_characters_keep_their_columns() {
+        let mut parser = vt100::Parser::new(2, 10, 0);
+        parser.process("\u{65e5}x".as_bytes());
+        let lines = screen_lines(parser.screen(), false);
+        let text: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.clone().into_owned())
+            .collect();
+        assert_eq!(text, "\u{65e5}x       ");
     }
 
     /// Wrapping arithmetic the scroll depends on.
@@ -2688,6 +3762,7 @@ mod tests {
                 "fix the failing retry tests in the worker service and update the changelog".into(),
             ),
             label: "devtools/production".into(),
+            base: Default::default(),
         });
         app.loading_step("Creating a cloud agent".into());
 
@@ -2724,34 +3799,73 @@ mod tests {
     #[test]
     fn wizard_rows_without_a_description_have_no_gap() {
         let mut app = app_with_tree();
-        // A second project, so "adjacent" means something.
-        app.tree[0].projects.push(ProjectNode {
-            id: "proj_2".into(),
-            name: "mono".into(),
+        // A second environment, so "adjacent" means something.
+        app.tree[0].projects[0].envs.push(EnvNode {
+            id: "env_stg".into(),
+            name: "staging".into(),
             expanded: false,
-            envs: vec![EnvNode {
-                id: "env_stg".into(),
-                name: "staging".into(),
-                expanded: false,
-                agents: Load::NotLoaded,
-            }],
+            agents: Load::NotLoaded,
         });
         app.skills_source = None;
         app.start_wizard(false);
         if let Some(w) = app.wizard.as_mut() {
-            w.step = crate::commands::cloud_agent::tui::wizard::Step::ProjectPick;
+            w.step = crate::commands::cloud_agent::tui::wizard::Step::Target;
+            // Expand the workspace's only project to reveal its environments
+            // — leaf rows carry no description.
+            w.workspaces[0].projects[0].expanded = true;
         }
 
         let out = draw(&app, 100, 30);
         let lines: Vec<&str> = out.lines().collect();
         let first = lines
             .iter()
-            .position(|l| l.contains("devtools (production)"))
-            .expect("the project row");
+            .position(|l| l.contains("production"))
+            .expect("the environment row");
         assert!(
-            lines[first + 1].contains("mono (staging)"),
+            lines[first + 1].contains("staging"),
             "rows should be adjacent:\n{out}"
         );
+    }
+
+    /// The settings card shows every value beside its name, and the
+    /// highlighted one wears the cycle arrows.
+    #[test]
+    fn the_settings_card_shows_values_in_place() {
+        let mut app = app_with_tree();
+        app.skills_source = Some("claude".into());
+        app.skills_enabled = true;
+        app.start_settings();
+
+        let out = draw(&app, 100, 40);
+        assert!(out.contains("Cloud agent settings"), "{out}");
+        assert!(
+            out.contains("‹ claude ›"),
+            "the highlighted row cycles in place:\n{out}"
+        );
+        assert!(out.contains("on · claude"), "{out}");
+        assert!(out.contains("Railway"), "the theme's label:\n{out}");
+        assert!(out.contains("Run first-time setup again"), "{out}");
+        assert!(
+            out.contains("not set"),
+            "no default project reads as such:\n{out}"
+        );
+    }
+
+    /// The project row opens the wizard's question as a sub-card and comes
+    /// straight back, rather than walking the rest of a flow.
+    #[test]
+    fn the_settings_project_picker_is_the_setup_question() {
+        let mut app = app_with_tree();
+        app.start_settings();
+        if let Some(settings) = app.settings.as_mut() {
+            settings.down(); // the project row
+            settings.select(); // opens the picker
+        }
+
+        let out = draw(&app, 100, 40);
+        assert!(out.contains("Where should agents live?"), "{out}");
+        assert!(out.contains("devtools (production)"), "{out}");
+        assert!(out.contains("Decide later"), "{out}");
     }
 
     /// A tree with nothing in it must not panic the renderer.
@@ -2761,5 +3875,48 @@ mod tests {
         app.screen = Screen::Manage;
         let out = draw(&app, 80, 24);
         assert!(out.contains("RAILWAY CLOUD-AGENTS"));
+    }
+
+    /// The gate card: name and fingerprint each on their own line (together
+    /// they outrun the card and wrap mid-fingerprint), and the answers in the
+    /// same badge-and-label chords as the footers.
+    #[test]
+    fn the_ssh_gate_card_lays_out_key_and_answers() {
+        use crate::commands::cloud_agent::tui::app::{SshGate, SshKeyOffer};
+        let mut app = app_with_tree();
+        app.ssh_gate = Some(SshGate {
+            offer: SshKeyOffer {
+                name: "raildesk-deploy".into(),
+                fingerprint: "SHA256:hlDEs7CV5clc1lMfsMxr/CPeuKuJNn9hJxjsy1e9zLc".into(),
+                public_key: "ssh-ed25519 AAAA test".into(),
+            },
+            then: None,
+        });
+        let out = draw(&app, 80, 30);
+        assert!(out.contains("Register your SSH key with Railway?"), "{out}");
+        assert!(out.contains(" y "), "{out}");
+        assert!(out.contains("Yes — register this key"), "{out}");
+        assert!(out.contains("No, not now"), "{out}");
+
+        let name_line = out
+            .lines()
+            .position(|l| l.contains("raildesk-deploy"))
+            .expect("key name shown");
+        let fp_line = out
+            .lines()
+            .position(|l| l.contains("SHA256:hlDEs7CV5clc1lMfsMxr/CPeuKuJNn9hJxjsy1e9zLc"))
+            .expect("full fingerprint shown, unwrapped");
+        assert_eq!(fp_line, name_line + 1, "fingerprint sits under the name");
+
+        // The answers are centered under the copy, not left-aligned with it.
+        let col = |needle: &str| {
+            out.lines()
+                .find_map(|l| l.find(needle))
+                .unwrap_or_else(|| panic!("{needle} not shown"))
+        };
+        assert!(
+            col("Yes — register this key") > col("raildesk-deploy"),
+            "the answers should sit centered, right of the left-aligned copy"
+        );
     }
 }

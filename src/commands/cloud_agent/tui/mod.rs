@@ -17,6 +17,7 @@
 
 pub mod app;
 pub mod session;
+pub mod settings;
 pub mod theme;
 mod ui;
 pub mod wizard;
@@ -27,9 +28,9 @@ use std::panic;
 use anyhow::Result;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind, KeyModifiers,
-    KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -41,30 +42,24 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
 use app::{
-    Agent, AgentOp, ConsoleSession, EnvNode, Load, LoadSessions, ProjectNode, WorkspaceNode,
+    Agent, AgentOp, ConsoleSession, EnvNode, HeldConnect, Load, LoadSessions, ProjectNode,
+    SshKeyOffer, SshKeyState, WorkspaceNode,
 };
-pub use app::{App, Effect, LaunchRequest, Target};
+pub use app::{App, Effect, LaunchRequest, Screen, Target};
 
 use crate::client::post_graphql;
 use crate::commands::code::{self, LaunchArgs, Prepared, Progress};
 use crate::config::Configs;
 use crate::gql::{mutations, queries};
 
-/// Create the project first-run setup offers to make.
+/// Create the project first-run setup offers to make, in the workspace the
+/// target step's "+ Create a project" row was chosen under.
 async fn create_default_project(
     client: &reqwest::Client,
     backboard: &str,
+    workspace_id: String,
 ) -> Result<wizard::ProjectOption> {
     use crate::gql::mutations;
-
-    let configs = Configs::new()?;
-    let workspaces = crate::workspace::workspaces_with_client(client, &configs).await?;
-    // No prompt here: the TUI owns the screen. The first workspace is the only
-    // one most accounts have, and setup can be re-run to move it.
-    let workspace = workspaces
-        .first()
-        .map(|ws| ws.id().to_string())
-        .ok_or_else(|| anyhow::anyhow!("no workspace to create a project in"))?;
 
     let created = post_graphql::<mutations::ProjectCreate, _>(
         client,
@@ -72,7 +67,7 @@ async fn create_default_project(
         mutations::project_create::Variables {
             name: Some("Cloud Agents".to_string()),
             description: Some("Home for Railway cloud agents".to_string()),
-            workspace_id: Some(workspace),
+            workspace_id: Some(workspace_id),
         },
     )
     .await?
@@ -118,6 +113,63 @@ fn save_setup(
     let _ = app;
     prefs.save_in(&home)?;
     Ok(prefs)
+}
+
+/// Write a change made on the ⌥s settings card.
+///
+/// Merged over the file rather than built fresh: the card saves on every
+/// change, and the skills exclude list — which no card edits — must survive
+/// a stroll through the settings untouched.
+fn save_settings(
+    outcome: &wizard::Outcome,
+) -> Result<crate::commands::cloud_agent::prefs::AgentPrefs> {
+    use crate::commands::cloud_agent::prefs::{AgentPrefs, DefaultProject};
+
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+    let mut prefs = AgentPrefs::load_in(&home).unwrap_or_default();
+    prefs.version = crate::commands::cloud_agent::prefs::CURRENT_VERSION;
+    prefs.agent = Some(outcome.agent.clone());
+    prefs.skills.enabled = outcome.skills;
+    prefs.skills.source = outcome.skills_source.clone();
+    prefs.default_project = outcome.project.as_ref().map(|p| DefaultProject {
+        project_id: p.project_id.clone(),
+        project_name: p.project_name.clone(),
+        environment_id: p.environment_id.clone(),
+        environment_name: p.environment_name.clone(),
+    });
+    prefs.theme = Some(outcome.theme.clone());
+    prefs.save_in(&home)?;
+    Ok(prefs)
+}
+
+/// Persist a settings-card change and bring the session along with it.
+///
+/// Quiet on success — the card itself shows the new value, and a status line
+/// per keypress while cycling a theme would be noise. Failure says so: a save
+/// that silently didn't happen is the worst thing a settings card can do.
+fn apply_settings(app: &mut App, outcome: &wizard::Outcome) {
+    match save_settings(outcome) {
+        // There are preferences now, whatever there was before.
+        Ok(_) => app.configured = true,
+        Err(err) => app.toast_error(format!("Couldn't save your settings: {err:#}")),
+    }
+    app.set_harness(Some(&outcome.agent));
+    app.set_theme(Some(&outcome.theme));
+    app.skills_enabled = outcome.skills;
+    match &outcome.project {
+        Some(project) => {
+            app.default_project = Some(project.project_id.clone());
+            app.target = Some(Target {
+                project_id: project.project_id.clone(),
+                project_name: project.project_name.clone(),
+                environment_id: project.environment_id.clone(),
+                environment_name: project.environment_name.clone(),
+            });
+        }
+        // "Decide later": the default is gone, but the target stays aimed for
+        // this run — clearing the default is not pointing the prompt away.
+        None => app.default_project = None,
+    }
 }
 
 /// Shorten a string for a toast, keeping the front — the host and the start of
@@ -196,6 +248,10 @@ enum Message {
     /// per-environment path.
     MyAgentsLoaded {
         result: Result<Vec<(String, Agent)>, String>,
+        /// When the request went out, which decides what this snapshot is
+        /// allowed to overwrite: anything the tree has heard since is fresher
+        /// news. See [`App::my_agents_loaded`].
+        asked_at: std::time::Instant,
     },
     /// A background fetch was refused for rate limiting. The rest of its batch
     /// is abandoned; see [`spawn_sweep`].
@@ -233,6 +289,18 @@ enum Message {
         error: Option<String>,
     },
     ProjectCreated(Result<wizard::ProjectOption, String>),
+    /// The gate's key registration finished. On success the held connect
+    /// resumes as the effect it was before the gate held it.
+    SshKeyRegistered {
+        result: Result<(), String>,
+        then: Option<HeldConnect>,
+    },
+    /// The under-frame Claude mint finished: the launch resumes on success,
+    /// and steps out for the manual-paste fallback on failure.
+    ClaudeMintDone {
+        ok: bool,
+        req: Box<LaunchRequest>,
+    },
     /// Ask again for one agent's sessions.
     RefreshAgentSessions(String),
     /// The session produced output, so the screen needs redrawing.
@@ -252,6 +320,74 @@ impl Progress for ChannelProgress {
     fn finish(&self) {}
 }
 
+/// A launch pipeline already running before the TUI took the screen, plus the
+/// request that started it. `railway code` starts the pipeline beside the
+/// tree load instead of after it — the tree is for drawing the manage screen,
+/// not something the launch consumes — and the loop adopts this on frame one
+/// exactly where it would otherwise have dispatched the autostart.
+pub(crate) struct InflightLaunch {
+    pub(crate) req: LaunchRequest,
+    rx: mpsc::UnboundedReceiver<Message>,
+}
+
+impl InflightLaunch {
+    /// Wait (bounded) for the running pipeline to settle, for a caller that is
+    /// about to abort with an error: the pipeline may already have CREATED an
+    /// agent, and exiting without saying so would orphan a billing VM with no
+    /// user-visible record. Returns the line to print when there is one.
+    pub(crate) async fn settle_for_abort(mut self, limit: std::time::Duration) -> Option<String> {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            match tokio::time::timeout_at(deadline, self.rx.recv()).await {
+                Ok(Some(Message::LaunchReady(prepared, _))) => {
+                    return Some(format!(
+                        "A launch was already in flight and created agent {} — `railway ca ssh {}` reattaches it, `railway ca delete {}` removes it.",
+                        prepared.agent_name, prepared.agent_name, prepared.agent_name
+                    ));
+                }
+                // Failed before creating anything worth reporting.
+                Ok(Some(Message::LaunchFailed(_))) => return None,
+                Ok(Some(_)) => continue,
+                // Pipeline gone or still running at the deadline: point at the
+                // list rather than guessing.
+                Ok(None) => return None,
+                Err(_) => {
+                    return Some(
+                        "A launch was still in flight — check `railway ca list` for an agent it may have created.".to_string(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Run the prepare pipeline for `req`, streaming progress and the outcome into
+/// `sink` as loop messages. Shared by [`start_launch`] (sink = the loop's own
+/// channel) and [`begin_launch_early`] (sink = a buffer the loop adopts later).
+fn spawn_prepare(req: LaunchRequest, sink: mpsc::UnboundedSender<Message>) {
+    tokio::spawn(async move {
+        let req = req;
+        let args = launch_args_for(&req);
+        let progress = ChannelProgress(sink.clone());
+        let message = match code::prepare(&args, &progress, code::SessionStyle::Pane).await {
+            Ok(prepared) => Message::LaunchReady(Box::new(prepared), Box::new(req)),
+            Err(err) => Message::LaunchFailed(format!("{err:#}")),
+        };
+        let _ = sink.send(message);
+    });
+}
+
+/// Start `req`'s pipeline now, before the TUI exists, buffering its messages
+/// until the loop adopts them. ONLY for launches every dispatch gate would
+/// wave through — the caller must have verified the SSH key is registered and
+/// no interactive Claude mint is needed, because a pipeline started here has
+/// no frame to raise those questions in and would surface them as failures.
+pub(crate) fn begin_launch_early(req: LaunchRequest) -> InflightLaunch {
+    let (tx, rx) = mpsc::unbounded_channel();
+    spawn_prepare(req.clone(), tx);
+    InflightLaunch { req, rx }
+}
+
 /// Build the tree from the workspace listing. Deleted projects are dropped, and
 /// so are environments the caller cannot access — an agent can't be listed or
 /// created in either, so showing them would only offer dead ends.
@@ -260,6 +396,7 @@ pub async fn load_tree(client: &reqwest::Client, configs: &Configs) -> Result<Ve
     Ok(workspaces
         .into_iter()
         .map(|ws| WorkspaceNode {
+            id: ws.id().to_string(),
             name: ws.name().to_string(),
             expanded: false,
             projects: ws
@@ -355,7 +492,8 @@ async fn fetch_my_agents(
         .collect())
 }
 
-/// Ask for the whole account's agents in the background, once, at startup.
+/// Ask for the whole account's agents in the background: at startup, on ⌥r, and
+/// on every automatic refresh.
 fn spawn_my_agents_fetch(
     tx: &mpsc::UnboundedSender<Message>,
     client: &reqwest::Client,
@@ -364,10 +502,17 @@ fn spawn_my_agents_fetch(
     let tx = tx.clone();
     let client = client.clone();
     let backboard = backboard.to_string();
+    // Stamped before the request goes out, not when the reply is applied: the
+    // snapshot describes the account as it was at this moment, and that is what
+    // it may not overwrite anything newer than.
+    let asked_at = std::time::Instant::now();
     tokio::spawn(async move {
         match fetch_my_agents(&client, &backboard).await {
             Ok(agents) => {
-                let _ = tx.send(Message::MyAgentsLoaded { result: Ok(agents) });
+                let _ = tx.send(Message::MyAgentsLoaded {
+                    result: Ok(agents),
+                    asked_at,
+                });
             }
             // A rate limit is worth its own message — the toast with the
             // Retry-After — rather than being folded into the fallback, which
@@ -379,11 +524,51 @@ fn spawn_my_agents_fetch(
                 None => {
                     let _ = tx.send(Message::MyAgentsLoaded {
                         result: Err(err.to_string()),
+                        asked_at,
                     });
                 }
             },
         }
     });
+}
+
+/// Ask the platform for everything again.
+///
+/// One request for the whole account (see [`fetch_my_agents`]), and the sessions
+/// of the agents someone is looking at once it lands — not a sweep. Every
+/// refresh in the TUI comes through here: ⌥r, the automatic tick, the re-entry
+/// after the terminal was handed back, and `shift+r` on an account that is
+/// already fully loaded.
+///
+/// Coalesced on [`App::refreshing`], so holding the chord or having three
+/// actions finish at once cannot stack account-wide queries.
+fn start_refresh(
+    app: &mut App,
+    tx: &mpsc::UnboundedSender<Message>,
+    client: &reqwest::Client,
+    backboard: &str,
+) {
+    if app.refreshing {
+        return;
+    }
+    app.refresh_started();
+    // Without `myCloudAgents` there is no account-wide question to ask, so the
+    // refresh asks per environment — but only about the ones that already have
+    // an answer or are open, never the whole account. Finding agents in
+    // environments that have never loaded stays `shift+r`, a deliberate act,
+    // because that is the one that costs a request each.
+    if app.account_query_unavailable {
+        let effects = app.environments_to_refresh();
+        // Each environment answers with its own `AgentsLoaded`, so there is no
+        // one reply to close the refresh out on: it is done being started, and
+        // the sweep's own limiter bounds what is in flight from here.
+        app.refresh_finished();
+        if !effects.is_empty() {
+            spawn_sweep(effects, tx, client, backboard, Default::default());
+        }
+        return;
+    }
+    spawn_my_agents_fetch(tx, client, backboard);
 }
 
 /// The reattachable shell and exec sessions on one agent's VM.
@@ -445,13 +630,17 @@ pub async fn run(
 
     // Ask for every agent the caller owns, in one request. If the platform
     // predates `myCloudAgents`, the reply says so and startup degrades to
-    // loading just the environments a keypress would immediately need. On
-    // re-entry after a session the tree has already settled, and the settle
-    // would discard a fresh answer — so don't spend the request.
+    // loading just the environments a keypress would immediately need.
+    //
+    // Every entry, not just the first: this is also how a re-entry catches up.
+    // Coming back from a full-screen session — or from the Claude mint — used to
+    // land on the snapshot taken before leaving, sometimes an hour old, because
+    // the guard here skipped the request whenever the tree had already settled
+    // and the settle would have discarded the answer anyway. A reply that may
+    // overwrite what it is newer than is not discarded, so the request is worth
+    // spending on every entry.
     let stop_fetching: StopFlag = Default::default();
-    if app.has_unloaded_environments() {
-        spawn_my_agents_fetch(&tx, &client, &backboard);
-    }
+    start_refresh(app, &tx, &client, &backboard);
 
     loop {
         let mut rects = app.panes;
@@ -467,15 +656,53 @@ pub async fn run(
         }
         sync_session_size(app, &terminal);
 
+        // A pipeline `railway code` already started beside the tree load:
+        // adopt it — the same screen moves as a dispatched launch, minus the
+        // gates, which were verified before it was allowed to start (see
+        // `begin_launch_early`).
+        if let Some(inflight) = app.autostart_inflight.take() {
+            let InflightLaunch { req, mut rx } = inflight;
+            app.screen = Screen::Manage;
+            if let Some(Effect::LoadAgents {
+                environment_id,
+                path,
+            }) = app.reveal_environment(&req.environment_id)
+            {
+                spawn_env_agents_fetch(environment_id, path, &tx, &client, &backboard);
+            }
+            app.start_loading(&req);
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                while let Some(message) = rx.recv().await {
+                    if tx.send(message).is_err() {
+                        break;
+                    }
+                }
+            });
+            continue;
+        }
+
+        // A launch the caller arrived with, started once the first frame is on
+        // screen so the terminal is already in the state the loading pane will
+        // draw into. Routed through the effect handling rather than straight to
+        // `start_launch`, so it meets the ssh-key gate and the Claude mint the
+        // same way a launch someone pressed a key for does.
+        if let Some(req) = app.autostart.take() {
+            dispatch_launch(app, req, &tx, &client, &backboard);
+            continue;
+        }
+
         let effect = tokio::select! {
             // Background work first: draining it keeps the tree and the session
             // honest even while keys arrive faster than frames.
             Some(message) = rx.recv() => handle_message(app, message, &tx, &client, &backboard, &stop_fetching),
             // Animate the loading screen. Only armed while it is showing, so an
             // idle TUI still blocks rather than spinning on a timer.
-            // The wizard borrows the same tick for its "creating…" spinner.
+            // The wizard and settings borrow the same tick for their
+            // "creating…" spinners.
             _ = tokio::time::sleep(SPINNER_TICK), if app.loading.active
-                || app.wizard.as_ref().is_some_and(|w| w.busy.is_some()) => {
+                || app.wizard.as_ref().is_some_and(|w| w.busy.is_some())
+                || app.settings.as_ref().is_some_and(|s| s.busy.is_some()) => {
                 app.tick();
                 None
             }
@@ -492,8 +719,34 @@ pub async fn run(
             _ = tokio::time::sleep(app::WATCH_TICK), if app.watching_agents() => {
                 app.watch_tick()
             }
+            // Everything else that changes an agent happens outside this
+            // process: another terminal, the dashboard, a teammate. One
+            // account-wide request every [`app::AUTO_REFRESH_EVERY`] is what
+            // keeps the tree from being a snapshot of when it opened. Armed only
+            // when a refresh would be right — see [`App::auto_refresh_in`] — so
+            // an idle TUI still blocks on the keyboard, and the remainder is
+            // recomputed each pass so an early wake just re-arms.
+            _ = tokio::time::sleep(app.auto_refresh_in().unwrap_or(std::time::Duration::MAX)),
+                if app.auto_refresh_in().is_some() => {
+                if app.auto_refresh_due() {
+                    start_refresh(app, &tx, &client, &backboard);
+                }
+                None
+            }
+            // A reattach that stays silent gets its "no response" notice drawn
+            // once the stall clock runs out; nothing else would redraw, since
+            // a silent pane by definition sends no output to wake the loop.
+            _ = tokio::time::sleep(app.stall_check_remaining().unwrap_or(std::time::Duration::MAX)),
+                if app.stall_check_remaining().is_some() => None,
+            // An ended pane whose finished/dropped call is still waiting on
+            // ssh's exit status: the EOF that woke the loop can beat waitpid,
+            // and the reader sends no further wake — poll until the status
+            // lands and the reap can decide.
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)),
+                if app.awaiting_exit_status() => app.reap_ended_sessions(),
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => app.on_key(key),
+                Some(Ok(Event::Paste(text))) => app.on_paste(text),
                 Some(Ok(Event::Mouse(mouse))) => {
                     let action = match mouse.kind {
                         MouseEventKind::Down(MouseButton::Left) => Some(app::MouseAction::Down),
@@ -521,10 +774,13 @@ pub async fn run(
         match effect {
             None => {}
             Some(Effect::Quit) => {
-                // Every open session sleeps on the way out; leaving one awake
-                // bills compute with nothing attached to it.
-                while !app.sessions.is_empty() {
-                    close_and_sleep(app, 0, &client, &backboard).await;
+                // Panes detach; agents stay running. Sleeping is a deliberate
+                // act (`s` on the tree, `railway ca sleep`) — an automatic
+                // sleep here killed every session's process while the
+                // platform kept listing the sessions as running, and the next
+                // reattach landed on a dead name and a blank pane.
+                while let Some(mut session) = app.take_session(0) {
+                    session.detach();
                 }
                 return Ok(Outcome::Quit);
             }
@@ -555,6 +811,17 @@ pub async fn run(
                 environment_id,
                 session_name,
             }) => {
+                // Same SSH gate as a launch: reattaching is a fresh ssh, and
+                // a key deregistered since the session opened would otherwise
+                // land on the relay's interactive signup screen.
+                if app.hold_for_ssh_key(HeldConnect::Reattach {
+                    agent_id: agent_id.clone(),
+                    agent_name: agent_name.clone(),
+                    environment_id: environment_id.clone(),
+                    session_name: session_name.clone(),
+                }) {
+                    continue;
+                }
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     let message = match code::connect_info(&environment_id, &agent_id).await {
@@ -577,24 +844,47 @@ pub async fn run(
                     let _ = tx.send(message);
                 });
             }
-            Some(Effect::CreateDefaultProject) => {
+            Some(Effect::StepOutForMint(req)) => {
+                return Ok(Outcome::NeedsCredential(req));
+            }
+            Some(Effect::RegisterSshKey { offer, then }) => {
+                let tx = tx.clone();
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let result = register_gate_key(&client, &offer).await;
+                    if let Err(message) = &result {
+                        crate::commands::ssh::tel::report_failure_for(
+                            "cloud_agent_launch",
+                            "ssh_key_register",
+                            message,
+                        )
+                        .await;
+                    }
+                    let _ = tx.send(Message::SshKeyRegistered { result, then });
+                });
+            }
+            Some(Effect::CreateDefaultProject(workspace_id)) => {
                 let tx = tx.clone();
                 let client = client.clone();
                 let backboard = backboard.clone();
                 tokio::spawn(async move {
-                    let result = create_default_project(&client, &backboard)
+                    let result = create_default_project(&client, &backboard, workspace_id)
                         .await
                         .map_err(|e| format!("{e:#}"));
                     let _ = tx.send(Message::ProjectCreated(result));
                 });
             }
             Some(Effect::SaveSetup(outcome)) => {
-                app.status = match save_setup(app, &outcome) {
+                match save_setup(app, &outcome) {
                     Ok(prefs) => {
                         tokio::spawn(async move {
                             super::telemetry::track_setup_saved("wizard", &prefs).await;
                         });
-                        "Saved — Setup again to change it".into()
+                        // Setup is where the account gets ready to connect, so
+                        // an unregistered key is offered here too — not just
+                        // at the first launch that would trip over it.
+                        app.offer_ssh_key_setup();
+                        app.status = "Saved — Setup again to change it".into();
                     }
                     Err(err) => {
                         let message = format!("{err:#}");
@@ -603,7 +893,7 @@ pub async fn run(
                             super::telemetry::track_setup_failed("wizard", &telemetry_message)
                                 .await;
                         });
-                        format!("Couldn't save your setup: {message}")
+                        app.toast_error(format!("Couldn't save your setup: {message}"));
                     }
                 };
                 // Apply it to the session that just chose it, or the prompt
@@ -621,13 +911,25 @@ pub async fn run(
                     });
                 }
             }
+            Some(Effect::SaveSettings(outcome)) => {
+                apply_settings(app, &outcome);
+            }
             Some(Effect::ScanEverywhere) => {
                 // A deliberate scan clears a previous rate-limit stop: the user
                 // is asking again, and by now the window may have passed.
                 stop_fetching.store(false, std::sync::atomic::Ordering::Relaxed);
                 let effects = app.scan_environments();
                 match effects.len() {
-                    0 => app.status = "Every project is already loaded".into(),
+                    // Nothing left to discover — the account-wide query answers
+                    // for every environment at once, so this is the normal case
+                    // rather than an edge one. "Every project is already loaded"
+                    // was a true sentence that did nothing, and it was the reply
+                    // anyone reaching for shift+r to see a new agent got.
+                    0 => {
+                        app.status = "Refreshing…".into();
+                        app.refresh_announce = true;
+                        start_refresh(app, &tx, &client, &backboard);
+                    }
                     n => {
                         app.status =
                             format!("Looking for agents in {n} more environment{}…", plural(n));
@@ -635,6 +937,7 @@ pub async fn run(
                     }
                 }
             }
+            Some(Effect::RefreshAll) => start_refresh(app, &tx, &client, &backboard),
             Some(Effect::OpenUrl(url)) => {
                 // Best-effort: a machine with no browser is a normal way to run
                 // this, and the ssh command in the toast is still copyable.
@@ -719,14 +1022,7 @@ pub async fn run(
                     });
                 });
             }
-            Some(Effect::Launch(req)) => {
-                // Minting needs a browser and a paste, neither of which works
-                // underneath a frame.
-                if req.harness == "claude" && !code::claude_credential_cached() {
-                    return Ok(Outcome::NeedsCredential(req));
-                }
-                start_launch(app, req, &tx);
-            }
+            Some(Effect::Launch(req)) => dispatch_launch(app, req, &tx, &client, &backboard),
             Some(Effect::LoadSessions { agent_id, path }) => {
                 spawn_session_fetch(agent_id, path, &tx, &client, &backboard);
             }
@@ -734,39 +1030,51 @@ pub async fn run(
                 environment_id,
                 path,
             }) => {
-                let tx = tx.clone();
-                let client = client.clone();
-                let backboard = backboard.clone();
-                tokio::spawn(async move {
-                    // A closed receiver just means the TUI already handed back;
-                    // the next entry re-requests, so the drop is harmless.
-                    match fetch_agents(&client, &backboard, &environment_id).await {
-                        Ok(agents) => {
-                            let _ = tx.send(Message::AgentsLoaded {
-                                path,
-                                result: Ok(agents),
-                            });
-                        }
-                        // The same classification the background fetches do:
-                        // a 429 puts the row back to "not loaded" with the
-                        // Retry-After toast, instead of pinning "rate limited"
-                        // to this one environment as if it were its failure.
-                        Err(err) => match rate_limit_from(&err) {
-                            Some(retry_after_secs) => {
-                                let _ = tx.send(Message::RateLimited { retry_after_secs });
-                            }
-                            None => {
-                                let _ = tx.send(Message::AgentsLoaded {
-                                    path,
-                                    result: Err(err.to_string()),
-                                });
-                            }
-                        },
-                    }
-                });
+                spawn_env_agents_fetch(environment_id, path, &tx, &client, &backboard);
             }
         }
     }
+}
+
+/// Fetch one environment's agents in the background, delivering the answer —
+/// or its rate-limit classification — as a message.
+fn spawn_env_agents_fetch(
+    environment_id: String,
+    path: (usize, usize, usize),
+    tx: &mpsc::UnboundedSender<Message>,
+    client: &reqwest::Client,
+    backboard: &str,
+) {
+    let tx = tx.clone();
+    let client = client.clone();
+    let backboard = backboard.to_string();
+    tokio::spawn(async move {
+        // A closed receiver just means the TUI already handed back;
+        // the next entry re-requests, so the drop is harmless.
+        match fetch_agents(&client, &backboard, &environment_id).await {
+            Ok(agents) => {
+                let _ = tx.send(Message::AgentsLoaded {
+                    path,
+                    result: Ok(agents),
+                });
+            }
+            // The same classification the background fetches do:
+            // a 429 puts the row back to "not loaded" with the
+            // Retry-After toast, instead of pinning "rate limited"
+            // to this one environment as if it were its failure.
+            Err(err) => match rate_limit_from(&err) {
+                Some(retry_after_secs) => {
+                    let _ = tx.send(Message::RateLimited { retry_after_secs });
+                }
+                None => {
+                    let _ = tx.send(Message::AgentsLoaded {
+                        path,
+                        result: Err(err.to_string()),
+                    });
+                }
+            },
+        }
+    });
 }
 
 fn handle_message(
@@ -795,13 +1103,23 @@ fn handle_message(
             // its row only exists now.
             app.expand_pending()
         }
-        Message::MyAgentsLoaded { result } => match result {
+        Message::MyAgentsLoaded { result, asked_at } => match result {
             Ok(agents) => {
-                app.my_agents_loaded(agents);
+                let count = agents.len();
+                app.refresh_finished();
+                app.my_agents_loaded(agents, asked_at);
                 let prefetch = app.sessions_to_prefetch();
                 if !prefetch.is_empty() {
                     spawn_session_prefetch(prefetch, tx, client, backboard, stop_fetching.clone());
                 }
+                // What someone is looking at, asked about again — the counts and
+                // session rows are as able to go stale as the agents are. Narrow
+                // by design: see [`App::sessions_to_refresh`].
+                let watched = app.sessions_to_refresh();
+                if !watched.is_empty() {
+                    spawn_session_prefetch(watched, tx, client, backboard, stop_fetching.clone());
+                }
+                app.refreshed(count);
                 // Normally redundant — a launch's own refetch answers this —
                 // but it is the safety net when that refetch failed before
                 // this settle arrived.
@@ -812,17 +1130,37 @@ fn handle_message(
             // it loaded before `myCloudAgents`: the environments a keypress
             // would immediately need.
             Err(err) => {
+                app.refresh_finished();
+                // The per-environment fallback below is the answer to whatever
+                // asked, and the rows are its report; a pending "up to date"
+                // line must not be claimed by the next refresh to succeed.
+                app.refresh_announce = false;
+                // Asking again every tick would fail again every tick: a caller
+                // this field refuses — a workspace-scoped token, or a backboard
+                // without it — is refused permanently, so refreshes switch to
+                // the per-environment path from here.
+                let first_failure = !app.account_query_unavailable;
+                app.account_query_unavailable = true;
                 // These are fresh requests; a stop left over from an earlier
                 // 429 would strand them as spinners that never resolve.
                 stop_fetching.store(false, std::sync::atomic::Ordering::Relaxed);
-                let sweep = app.initial_environments();
+                let mut sweep = app.initial_environments();
                 if sweep.is_empty() {
+                    // Nothing left to load for the first time, so this was a
+                    // refresh rather than startup — and it still has to refresh
+                    // something. Without this, the ⌥r that discovered the field
+                    // was unavailable would change nothing and only the next one
+                    // would work.
+                    sweep = app.environments_to_refresh();
+                }
+                if !sweep.is_empty() {
+                    spawn_sweep(sweep, tx, client, backboard, stop_fetching.clone());
+                } else if first_failure {
                     // No target and no default project means nothing loads
                     // lazily either — without this line an expired login
-                    // looks like an account with no agents anywhere.
-                    app.status = format!("Couldn't load agents: {err}");
-                } else {
-                    spawn_sweep(sweep, tx, client, backboard, stop_fetching.clone());
+                    // looks like an account with no agents anywhere. Said once:
+                    // a refresh that keeps failing must not toast on a timer.
+                    app.toast_error(format!("Couldn't load agents: {err}"));
                 }
                 None
             }
@@ -904,9 +1242,47 @@ fn handle_message(
         Message::ProjectCreated(result) => {
             if let Some(w) = app.wizard.as_mut() {
                 w.project_created(result);
+            } else if let Some(outcome) = app
+                .settings
+                .as_mut()
+                .and_then(|s| s.project_created(result))
+            {
+                // A create that stuck is a change; it saves like any other.
+                apply_settings(app, &outcome);
             }
             None
         }
+        Message::ClaudeMintDone { ok, req } => {
+            if ok {
+                // The cache holds the token now; the pipeline reads it there.
+                start_launch(app, *req, tx);
+            } else {
+                // The manual paste needs the real terminal. Stop the loading
+                // screen and hand the request back through the step-out; the
+                // fallback skips straight to the paste prompt rather than
+                // re-running the automation that just lost.
+                app.loading.active = false;
+                return Some(Effect::StepOutForMint(*req));
+            }
+            None
+        }
+        Message::SshKeyRegistered { result, then } => match result {
+            Ok(()) => {
+                app.ssh_key = SshKeyState::Ready;
+                app.toast("SSH key registered");
+                // The held connect resumes as the effect it was; it passes the
+                // now-Ready gate and takes the normal path from there.
+                then.map(HeldConnect::into_effect)
+            }
+            Err(message) => {
+                // Still unregistered: the next connect raises the gate again.
+                // The toast gets the first line; register_ssh_key already maps
+                // the duplicate-fingerprint rejection to something actionable.
+                let first = message.lines().next().unwrap_or("registration failed");
+                app.toast_error(format!("Couldn't register the key: {first}"));
+                None
+            }
+        },
         Message::SessionKilled {
             agent_id,
             session_name,
@@ -924,7 +1300,9 @@ fn handle_message(
         }
         Message::RefreshAgentSessions(agent_id) => app.refresh_agent_sessions(&agent_id),
         // The draw at the top of the loop is the response.
-        Message::SessionOutput => None,
+        // Output also carries the end: the reader thread flips `ended` and
+        // sends one last wake, which is when a finished pane gets closed.
+        Message::SessionOutput => app.reap_ended_sessions(),
     }
 }
 
@@ -1191,6 +1569,23 @@ fn spawn_session_prefetch(
     });
 }
 
+/// Register the gate's key with Railway. String errors because the result
+/// crosses the message channel; `register_ssh_key` has already mapped the
+/// duplicate-fingerprint rejection to a user-facing message.
+async fn register_gate_key(client: &reqwest::Client, offer: &SshKeyOffer) -> Result<(), String> {
+    let configs = Configs::new().map_err(|e| format!("{e:#}"))?;
+    crate::controllers::ssh::keys::register_ssh_key(
+        client,
+        &configs,
+        &offer.name,
+        &offer.public_key,
+        None,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("{e:#}"))
+}
+
 /// Re-ask for an agent's sessions shortly after one is opened.
 fn schedule_session_refresh(agent_id: String, tx: &mpsc::UnboundedSender<Message>) {
     let tx = tx.clone();
@@ -1214,7 +1609,7 @@ fn schedule_session_refresh(agent_id: String, tx: &mpsc::UnboundedSender<Message
 /// dropped it, leaving the pipeline to infer one and create a VM when it could
 /// not. Tested directly, so a dropped field fails here rather than on a bill.
 fn launch_args_for(req: &LaunchRequest) -> LaunchArgs {
-    LaunchArgs::for_target(
+    (*req.base).clone().retargeted(
         req.project_id.clone(),
         req.environment_id.clone(),
         &req.harness,
@@ -1224,20 +1619,65 @@ fn launch_args_for(req: &LaunchRequest) -> LaunchArgs {
     )
 }
 
+/// Everything a launch has to clear before the pipeline sees it: the screen it
+/// belongs on, the ssh key it will connect with, and the Claude credential it
+/// may need minting.
+///
+/// A function rather than the body of one match arm because two things start
+/// launches — an [`Effect::Launch`] someone pressed a key for, and the
+/// `autostart` a `railway code` invocation arrived with — and the second must
+/// clear exactly the same gates as the first. Each gate that holds the launch
+/// stores it and returns; the loop redraws with whatever question it raised.
+fn dispatch_launch(
+    app: &mut App,
+    req: LaunchRequest,
+    tx: &mpsc::UnboundedSender<Message>,
+    client: &reqwest::Client,
+    backboard: &str,
+) {
+    // The launch lives on the manage screen — the tree the agent will land in —
+    // so go there first and reveal its environment. The ssh gate's question
+    // then hangs over the place the answer matters, not over the menu it
+    // happened to be asked from.
+    app.screen = Screen::Manage;
+    if let Some(Effect::LoadAgents {
+        environment_id,
+        path,
+    }) = app.reveal_environment(&req.environment_id)
+    {
+        spawn_env_agents_fetch(environment_id, path, tx, client, backboard);
+    }
+    // Connecting rides SSH, so an unregistered key is settled with an in-frame
+    // question before anything is spent on the launch.
+    if app.hold_for_ssh_key(HeldConnect::Launch(req.clone())) {
+        return;
+    }
+    // The mint's browser round-trip needs no terminal — the browser does the
+    // interacting and the flow runs hidden — so it runs under the frame with
+    // the loading screen narrating. Only its manual-paste fallback needs the
+    // real terminal, and only that failure steps out (see ClaudeMintDone).
+    if req.harness == "claude" && code::claude_needs_local_mint() {
+        app.start_loading(&req);
+        let _ = tx.send(Message::LaunchStep(
+            "Minting a Claude token — approve the browser prompt if one appears".to_string(),
+        ));
+        let tx = tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let ok = code::mint_claude_credential_headless().is_ok();
+            let _ = tx.send(Message::ClaudeMintDone {
+                ok,
+                req: Box::new(req),
+            });
+        });
+        return;
+    }
+    start_launch(app, req, tx);
+}
+
 /// Kick off a launch in the background and show the loading screen.
 fn start_launch(app: &mut App, req: LaunchRequest, tx: &mpsc::UnboundedSender<Message>) {
     app.start_loading(&req);
-    let tx = tx.clone();
-    tokio::spawn(async move {
-        let req = req;
-        let args = launch_args_for(&req);
-        let progress = ChannelProgress(tx.clone());
-        let message = match code::prepare(&args, &progress).await {
-            Ok(prepared) => Message::LaunchReady(Box::new(prepared), Box::new(req)),
-            Err(err) => Message::LaunchFailed(format!("{err:#}")),
-        };
-        let _ = tx.send(message);
-    });
+    spawn_prepare(req, tx.clone());
 }
 
 /// One lifecycle mutation. Kept next to the loop rather than in the app so the
@@ -1283,48 +1723,11 @@ async fn run_agent_op(
 ///
 /// Detach only. The agent keeps running, because it may well have other
 /// sessions on it and because sleeping is `s` — a deliberate act on the agent,
-/// not a side effect of closing one window onto it. Quitting still sleeps
-/// everything, which is what stops an agent billing forever.
+/// not a side effect of closing one window onto it. Quitting detaches the
+/// same way; `railway ca sleep` (or `s` on the tree) is what stops the bill.
 async fn close_session(app: &mut App, index: usize, _client: &reqwest::Client, _backboard: &str) {
     if let Some(mut session) = app.take_session(index) {
         session.detach();
-    }
-}
-
-/// Detach a session and sleep its agent — the way out, where nothing is left
-/// watching and an awake agent would bill unattended.
-async fn close_and_sleep(app: &mut App, index: usize, client: &reqwest::Client, backboard: &str) {
-    let Some(mut session) = app.take_session(index) else {
-        return;
-    };
-    let agent_id = session.agent_id.clone();
-    let environment_id = session.environment_id().map(str::to_string);
-    session.detach();
-    drop(session);
-
-    // Without the environment there is no relay target, so the disk cannot be
-    // quiesced first. Sleeping anyway is still right: an agent left awake with
-    // nothing watching it bills until someone notices.
-    let result = match environment_id {
-        Some(environment_id) => {
-            crate::controllers::cloud_agent::sleep(client, backboard, &environment_id, &agent_id)
-                .await
-        }
-        None => post_graphql::<mutations::CloudAgentSleep, _>(
-            client,
-            backboard.to_string(),
-            mutations::cloud_agent_sleep::Variables { id: agent_id },
-        )
-        .await
-        .map(|_| ())
-        .map_err(Into::into),
-    };
-    // Worth its own event, not just a silent `let _ =`: a failure here is an
-    // agent left running and billing compute with nothing attached to it —
-    // exactly the case sleep-on-quit exists to prevent.
-    if let Err(err) = result {
-        let message = format!("{err:#}");
-        super::telemetry::track_session_event("quit_sleep_failed", Some(message.as_str())).await;
     }
 }
 
@@ -1332,7 +1735,7 @@ async fn close_and_sleep(app: &mut App, index: usize, client: &reqwest::Client, 
 /// draw, when the layout that produced the pane is known. A mismatch here is
 /// what makes a remote TUI wrap in the wrong place.
 fn sync_session_size(app: &mut App, terminal: &Terminal<CrosstermBackend<std::io::Stdout>>) {
-    let Some((rows, cols)) = ui::session_pane_size(terminal.size().ok(), app.maximized) else {
+    let Some((rows, cols)) = ui::session_pane_size(terminal.size().ok(), app.pane_is_full()) else {
         return;
     };
     // Every session gets the pane's shape, not just the visible one: a
@@ -1364,13 +1767,43 @@ fn finish_copy(app: &mut App, text: Option<String>) {
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
     enable_raw_mode()?;
+    // While the TUI holds the terminal, no inquire prompt can work — the event
+    // loop would eat its keystrokes and the next frame would paint over it.
+    // This flag makes every prompt helper (and ensure_ssh_key's registration
+    // fallback) fail fast instead of deadlocking the caller.
+    crate::util::prompt::set_terminal_owned(true);
     // Mouse capture takes the terminal's own selection away, which is why the
     // TUI implements drag-to-copy itself.
-    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)?;
+    //
+    // Bracketed paste is what keeps a paste from arriving as typed keys: text
+    // inserted by the terminal — ⌘v, and dictation tools like Wispr Flow,
+    // which insert into a terminal the same way — comes wrapped in markers
+    // and reaches the loop as one `Event::Paste`, instead of a stream of
+    // keystrokes whose every newline hits Enter in the pane.
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        Hide
+    )?;
     // Ask for the enhanced keyboard protocol, which is what makes a modifier on
-    // Escape reportable at all: a plain terminal sends shift+esc as a bare Escape,
+    // Escape reportable at all: a plain terminal sends ⇧esc as a bare Escape,
     // indistinguishable from the one meant for the agent. Terminals that do not
     // support it ignore the request, which is why `^]` and `^o` also release.
+    //
+    // Disambiguation is deliberately the only flag, and it is worth knowing what
+    // it does not buy. The kitty protocol exempts Enter, Tab and Backspace from
+    // this mode by design — "they still generate the same bytes as in legacy
+    // mode", so a shell stays usable if a crashed program leaves the mode set —
+    // which means shift+enter reaches us as a bare `\r` with no modifier on it,
+    // and no amount of work in `encode_key_for` can recover what the terminal
+    // never said. REPORT_ALL_KEYS_AS_ESCAPE_CODES would lift the exemption, but
+    // crossterm cannot yet read the associated text those events carry, so
+    // composed input would break: the ⌥-composed characters `alt_chord` leans
+    // on, and every dead key and IME besides. Reporting shift+enter is the
+    // terminal's job to opt into (Claude Code's own `/terminal-setup` binds it
+    // to `ESC CR` for exactly this reason); when it does, the pane forwards it.
     if matches!(
         crossterm::terminal::supports_keyboard_enhancement(),
         Ok(true)
@@ -1390,14 +1823,21 @@ fn restore_terminal() {
     // Popping a protocol that was never pushed is harmless; leaving one pushed
     // would follow the user out of the TUI and into their shell.
     let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
-    let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen, Show);
+    let _ = execute!(
+        stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show
+    );
     // Again, on the main screen. Mouse tracking left on is the one piece of
     // state the user cannot see and cannot clear: every pointer movement
     // becomes `35;21;32M` at their shell prompt. Terminals disagree about
     // whether the modes belong to the screen buffer that set them, so turn
     // them off on both.
-    let _ = execute!(stdout(), DisableMouseCapture);
+    let _ = execute!(stdout(), DisableBracketedPaste, DisableMouseCapture);
     let _ = disable_raw_mode();
+    crate::util::prompt::set_terminal_owned(false);
     let _ = stdout().flush();
 }
 
@@ -1416,6 +1856,7 @@ mod tests {
             harness: "claude".into(),
             prompt: None,
             label: "devtools/production".into(),
+            base: Default::default(),
         }
     }
 
@@ -1458,6 +1899,38 @@ mod tests {
         assert!(command.contains("agent:env_1:ca_1@"), "{command}");
         // The target is a username on the relay, not a host of its own.
         assert!(!command.contains(" agent:env_1:ca_1 "), "{command}");
+    }
+
+    /// A `railway code` launch opens in the pane, so its flags reach the
+    /// pipeline through the request rather than straight off the command line.
+    /// The ones no card asks for have nowhere else to travel.
+    /// Compared whole rather than field by field: `--name` and `--variable`
+    /// are private to `code`, and comparing against the retargeted base is the
+    /// stronger claim anyway — nothing was dropped, not just the two we
+    /// thought to name.
+    #[test]
+    fn a_command_line_launch_keeps_the_flags_it_arrived_with() {
+        use clap::Parser;
+
+        let base = LaunchArgs::parse_from(["code", "--new", "--name", "api", "--variable", "K=V"]);
+        let args = launch_args_for(&LaunchRequest {
+            base: Box::new(base.clone()),
+            force_new: true,
+            ..request()
+        });
+        assert_eq!(
+            args,
+            base.retargeted(
+                "proj_1".into(),
+                "env_prod".into(),
+                "claude",
+                true,
+                None,
+                None
+            )
+        );
+        // And the request is what aimed it: the base named no target.
+        assert_eq!(args.environment.as_deref(), Some("env_prod"));
     }
 
     /// A prompt rides through to the session it seeds.

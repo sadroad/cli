@@ -92,7 +92,7 @@ pub async fn get_service_instance_id(
 /// CLI doesn't need to distinguish — it passes `workspaceId: null` and
 /// the resolver defaults from `ctx.workspace.id` when present.
 pub async fn ensure_ssh_key(client: &Client, configs: &Configs) -> Result<Option<PathBuf>> {
-    ensure_ssh_key_impl(client, configs, true).await
+    ensure_ssh_key_impl(client, configs, true, true).await
 }
 
 /// `ensure_ssh_key` without the "Using SSH key from ..." announcement when a
@@ -100,13 +100,25 @@ pub async fn ensure_ssh_key(client: &Client, configs: &Configs) -> Result<Option
 /// ssh is plumbing, not the product. First-run registration still prompts
 /// and prints normally.
 pub async fn ensure_ssh_key_quiet(client: &Client, configs: &Configs) -> Result<Option<PathBuf>> {
-    ensure_ssh_key_impl(client, configs, false).await
+    ensure_ssh_key_impl(client, configs, false, true).await
+}
+
+/// [`ensure_ssh_key_quiet`] that never prompts: the registration path errors
+/// with the recipe instead. For callers running concurrently with another
+/// interactive flow — two prompt sequences interleaved on one terminal are
+/// gibberish — which retry interactively afterwards if they want the prompt.
+pub async fn ensure_ssh_key_noninteractive(
+    client: &Client,
+    configs: &Configs,
+) -> Result<Option<PathBuf>> {
+    ensure_ssh_key_impl(client, configs, false, false).await
 }
 
 async fn ensure_ssh_key_impl(
     client: &Client,
     configs: &Configs,
     announce: bool,
+    interactive: bool,
 ) -> Result<Option<PathBuf>> {
     let local_keys = find_local_ssh_keys().await?;
 
@@ -142,8 +154,13 @@ async fn ensure_ssh_key_impl(
         return Ok(identity_for(key));
     }
 
-    // No local key is registered - need to register one
-    if !std::io::stdin().is_terminal() {
+    // No local key is registered - need to register one. A TUI that owns the
+    // terminal can't host the registration prompt any more than a pipe can —
+    // its event loop consumes the keystrokes and repaints over the output —
+    // so both get the recipe instead. `railway ca` runs this same function as
+    // a preflight before taking the screen, so inside its TUI this path only
+    // fires if the key disappeared mid-session.
+    if !interactive || !std::io::stdin().is_terminal() || crate::util::prompt::terminal_owned() {
         bail!(
             "No registered SSH keys found. Register one with:\n  railway ssh keys add\n\n\
             Or import from GitHub:\n  railway ssh keys github"
@@ -420,6 +437,38 @@ pub fn run_native_ssh_with_opts(
     Ok(status.code().unwrap_or(1))
 }
 
+/// Marker a readiness probe asks the guest to echo back. Success is this
+/// string round-tripping, never the exit code: the relay answers a session
+/// against a target it cannot route yet with a status JSON and a clean exit
+/// 0, so `ssh <target> true` reports success seconds before a command can
+/// actually run (verified against prod, 2026-08-13).
+const PROBE_MARKER: &str = "RAILWAY_CONNECT_PROBE_OK";
+
+/// Silently test whether a target is connectable yet: ask it to echo a
+/// marker, with success defined as the marker coming back. Failure carries no
+/// diagnosis (a booting agent and a typo'd target look the same), so callers
+/// only ever use this inside a loop that also watches status.
+pub fn probe_native_ssh(
+    ssh_target: &str,
+    identity_file: Option<&Path>,
+    extra_opts: &[String],
+) -> Result<bool> {
+    let (mut ssh_cmd, target) = base_ssh_command(ssh_target, identity_file);
+    for opt in extra_opts {
+        ssh_cmd.arg(opt);
+    }
+    // Bound the probe so one blackholed connection can't eat the caller's
+    // whole readiness budget; the loop retries anyway.
+    ssh_cmd.arg("-o").arg("ConnectTimeout=10");
+    ssh_cmd.arg("-T");
+    ssh_cmd.arg(&target);
+    ssh_cmd.arg(format!("echo {PROBE_MARKER}"));
+    ssh_cmd.stdin(Stdio::null());
+    ssh_cmd.stderr(Stdio::null());
+    let output = ssh_cmd.output().context("Failed to execute ssh command")?;
+    Ok(output.status.success() && String::from_utf8_lossy(&output.stdout).contains(PROBE_MARKER))
+}
+
 /// One `-L` style forward: localhost:`local_port` → 127.0.0.1:`remote_port`
 /// inside the target.
 #[derive(Clone)]
@@ -631,6 +680,13 @@ pub fn run_native_ssh_captured(
     for opt in extra_opts {
         ssh_cmd.arg(opt);
     }
+    // Bound the connect the same way `probe_native_ssh` does. Without it a
+    // blackholed connection hangs forever: `ServerAliveInterval` only polices a
+    // session that is already established, and `ssh_plumbing`'s retry budget is
+    // fiction if a single attempt never returns. Observed in the wild as a
+    // launch parked on "Finalizing Configuration..." with no error and no
+    // timeout, on a VM that was up and billing.
+    ssh_cmd.arg("-o").arg("ConnectTimeout=10");
     ssh_cmd.arg("-T");
     ssh_cmd.arg(&target);
     ssh_cmd.arg(command);

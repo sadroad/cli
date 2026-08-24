@@ -27,12 +27,21 @@ pub struct Args {
     /// Print the current preferences and exit
     #[clap(long)]
     show: bool,
+
+    /// Clear saved preferences and any cached Claude auth token, then exit
+    /// without prompting. The same as choosing "Reset to default" from the
+    /// interactive prompts, for a script or a machine with no terminal
+    #[clap(long)]
+    reset: bool,
 }
 
 /// The harnesses a cloud agent can launch today. Every one of these ships in
 /// `cloud-agent-base`; what differs is whether the launcher can carry the
 /// user's credential to it, which is why droid and cursor are absent — their
-/// CLI sign-ins have no copyable local form.
+/// CLI sign-ins have no copyable local form. Railway's own harness needs no
+/// credential at all — see `Agent::Railway` in `commands/code.rs` — so
+/// `config_dir`/`bin` here are only ever meaningful as a "you happen to have
+/// this installed locally too" hint, not a requirement.
 struct Harness {
     slug: &'static str,
     name: &'static str,
@@ -42,6 +51,12 @@ struct Harness {
 }
 
 const HARNESSES: &[Harness] = &[
+    Harness {
+        slug: "railway",
+        name: "Railway",
+        config_dir: ".railway-agent",
+        bin: "railway-agent",
+    },
     Harness {
         slug: "claude",
         name: "Claude Code",
@@ -114,12 +129,26 @@ impl fmt::Display for SourceChoice {
     }
 }
 
+impl Args {
+    /// Whether this run needs a Railway credential. `--show` only prints what
+    /// is already on disk, and the non-interactive path picks a harness from
+    /// what it can see locally; only the prompts reach the API, to ask which
+    /// project agents should land in.
+    pub fn needs_credential(&self, interactive: bool) -> bool {
+        !self.show && !self.yes && interactive
+    }
+}
+
 pub async fn command(args: Args) -> Result<()> {
     let home = dirs::home_dir().context("Unable to get home directory")?;
     let existing = AgentPrefs::load_in(&home);
 
     if args.show {
         return show(&home, existing.as_ref());
+    }
+
+    if args.reset {
+        return reset(&home);
     }
 
     let non_interactive = args.yes || !is_stdout_terminal();
@@ -137,6 +166,25 @@ pub async fn command(args: Args) -> Result<()> {
         }
     }
     print_summary(&home, &prefs)?;
+    Ok(())
+}
+
+/// Clear saved preferences and the cached Claude setup-token, back to a clean
+/// slate.
+///
+/// Preferences alone would leave a stale credential behind for the next setup
+/// to silently pick back up — the same reason `railway logout` drops it too.
+/// Best-effort on the token cache, same as everywhere else it is cleared: a
+/// preferences reset should not fail over a file that was already gone.
+fn reset(home: &Path) -> Result<()> {
+    let path = AgentPrefs::path_in(home);
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("Failed to remove {}", path.display()))?;
+    }
+    crate::commands::code::clear_claude_token_cache_in(home);
+    println!("Cleared cloud agent preferences and cached tokens.");
+    println!("Run {} to configure again.", "railway ca setup".cyan());
     Ok(())
 }
 
@@ -173,6 +221,13 @@ fn non_interactive_prefs(home: &Path, existing: Option<AgentPrefs>) -> AgentPref
 async fn prompt(home: &Path, existing: Option<AgentPrefs>) -> Result<AgentPrefs> {
     println!("\n{}\n", "Railway Cloud Agent Setup".bold().cyan());
 
+    // Only worth asking when there is something to reset — a first run has no
+    // preferences and no cached token either.
+    if existing.is_some() && prompt_reset_to_default()? {
+        reset(home)?;
+        return Ok(AgentPrefs::default());
+    }
+
     let previous = existing.clone().unwrap_or_default();
     let default_project = prompt_default_project(previous.default_project.clone()).await?;
     let agent = prompt_agent(home, previous.agent.as_deref())?;
@@ -187,6 +242,40 @@ async fn prompt(home: &Path, existing: Option<AgentPrefs>) -> Result<AgentPrefs>
         default_project,
         theme: Some(theme),
     })
+}
+
+/// What to do about preferences that are already there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetupMode {
+    Edit,
+    Reset,
+}
+
+impl fmt::Display for SetupMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SetupMode::Edit => write!(f, "Continue — review and update my preferences"),
+            SetupMode::Reset => write!(
+                f,
+                "Reset to default  {}",
+                "— clear preferences and cached tokens".dimmed()
+            ),
+        }
+    }
+}
+
+/// Asked only when there are existing preferences to do something about.
+/// `true` means the caller should reset and stop, rather than walk the rest
+/// of the questions.
+fn prompt_reset_to_default() -> Result<bool> {
+    let choice = inquire::Select::new(
+        "Existing cloud agent preferences found:",
+        vec![SetupMode::Edit, SetupMode::Reset],
+    )
+    .with_render_config(Configs::get_render_config())
+    .prompt()
+    .context("Failed to prompt for the setup mode")?;
+    Ok(choice == SetupMode::Reset)
 }
 
 /// The agent picker on its own, so a launch with no configured default can ask
@@ -547,6 +636,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reset_removes_the_preferences_file() {
+        let home = tempfile::tempdir().unwrap();
+        AgentPrefs {
+            agent: Some("claude".into()),
+            ..Default::default()
+        }
+        .save_in(home.path())
+        .unwrap();
+        assert!(AgentPrefs::path_in(home.path()).exists());
+
+        reset(home.path()).unwrap();
+        assert!(!AgentPrefs::path_in(home.path()).exists());
+    }
+
+    /// No preferences file yet — resetting is a no-op, not an error.
+    #[test]
+    fn reset_without_a_preferences_file_is_fine() {
+        let home = tempfile::tempdir().unwrap();
+        reset(home.path()).unwrap();
+    }
+
+    #[test]
     fn detects_a_harness_by_its_config_directory() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".codex")).unwrap();
@@ -565,7 +676,7 @@ mod tests {
             .iter()
             .map(|c| c.slug)
             .collect();
-        assert_eq!(slugs, vec!["claude", "codex", "grok"]);
+        assert_eq!(slugs, vec!["railway", "claude", "codex", "grok"]);
     }
 
     #[test]

@@ -80,6 +80,22 @@ pub async fn track_launch_outcome(
     .await;
 }
 
+/// [`track_launch_outcome`] fire-and-forget, for the success path: the event
+/// posts a real HTTP round-trip (up to 3s), and awaiting it sat directly
+/// between "agent provisioned" and "session opens" on every launch. The
+/// session that follows runs for minutes, so the detached send always gets
+/// time to complete; failures keep the awaited form because the process is
+/// about to exit and would drop a spawned task.
+pub fn track_launch_outcome_detached(
+    harness: &'static str,
+    created: Option<bool>,
+    duration: Duration,
+) {
+    crate::commands::ssh::tel::spawn_detached(async move {
+        track_launch_outcome(harness, created, duration, None).await;
+    });
+}
+
 /// One lifecycle mutation on an agent (sleep/wake/delete) from the manage
 /// screen, fired once per attempt so both volume and failure rate are
 /// visible per op kind.
@@ -123,6 +139,18 @@ pub async fn track_lifecycle(kind: &str, duration: Duration, error: Option<&str>
     .await;
 }
 
+/// [`track_lifecycle`] fire-and-forget, for path-marker events (`ssh_command`,
+/// `ssh_attach`, `ssh_new_session`) fired right before a session opens: the
+/// send is an HTTP round-trip, and awaiting it put that round-trip between
+/// the user and their shell. The session that follows gives the detached task
+/// plenty of runway; completion events at command exit keep the awaited form
+/// so a returning process can't drop them.
+pub fn track_lifecycle_detached(kind: &'static str) {
+    crate::commands::ssh::tel::spawn_detached(async move {
+        track_lifecycle(kind, Duration::ZERO, None).await;
+    });
+}
+
 /// The slug a lifecycle verb reports under. Split out so the shape dashboards
 /// group on is pinned by a test rather than by reading the call sites.
 fn lifecycle_sub_command(kind: &str, failed: bool) -> String {
@@ -148,6 +176,36 @@ pub async fn track_session_event(kind: &str, error: Option<&str>) {
     .await;
 }
 
+/// `railway ca` was run with no credential and sent the user through the login
+/// flow before doing what they asked. Fired once per forwarded run, so the
+/// share of `ca` invocations that are somebody's first Railway command — and
+/// how often that hand-off fails — is visible without inferring it from the
+/// gap between a `login` event and a `cloud_agent` one.
+pub async fn track_login_forwarded(error: Option<&str>) {
+    telemetry::send(event(
+        "cloud_agent",
+        "login_forwarded".to_string(),
+        0,
+        error.is_none(),
+        error.map(truncate),
+    ))
+    .await;
+}
+
+/// Someone ran a cloud agent command without the `CLOUD_AGENTS` flag and was
+/// stopped by the preflight. Counts the demand sitting behind the flag, which
+/// the API-side rejection never surfaced as its own event.
+pub async fn track_access_blocked() {
+    telemetry::send(event(
+        "cloud_agent",
+        "flag_missing".to_string(),
+        0,
+        false,
+        None,
+    ))
+    .await;
+}
+
 /// `railway ca setup` or the TUI wizard saved preferences. `entry` is
 /// `"cli"` or `"wizard"` — the two call sites share this mapping so both
 /// land in the same shape.
@@ -156,6 +214,23 @@ pub async fn track_session_event(kind: &str, error: Option<&str>) {
 /// of `commands/service.rs`'s `track_service_source`, rather than one event
 /// with all four combined: keeps `sub_command` cardinality small and each
 /// fact independently queryable.
+/// A `railway ca desktop` run that wrote its config.
+///
+/// `apps` is the comma-joined harness slugs the run configured — a fixed set,
+/// like every other slug in this module, so nothing user-supplied rides along.
+/// Failures are already reported by the generic dispatch event; this only marks
+/// which apps people actually point at an agent.
+pub async fn track_desktop_configured(apps: &str) {
+    telemetry::send(event(
+        "cloud_agent",
+        format!("desktop_{apps}"),
+        0,
+        true,
+        None,
+    ))
+    .await;
+}
+
 pub async fn track_setup_saved(entry: &str, prefs: &AgentPrefs) {
     let harness = prefs.agent.as_deref().unwrap_or("none");
     telemetry::send(event(

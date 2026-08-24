@@ -20,7 +20,11 @@ use crate::gql::{mutations, queries};
 /// routes, a wake restores a checkpoint and is much quicker.
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
-/// Gap between readiness polls.
+/// Gap between readiness polls. A fresh boot reaches running in single-digit
+/// seconds, and every poll-width of delay is pure wait the user sees — so poll
+/// fast while a normal boot is still plausible, then back off for the tail.
+const POLL_INTERVAL_FAST: std::time::Duration = std::time::Duration::from_millis(400);
+const POLL_FAST_WINDOW: std::time::Duration = std::time::Duration::from_secs(20);
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// An agent's lifecycle state, normalised across the four generated enums that
@@ -190,6 +194,30 @@ pub async fn list_in_environment(
         .collect())
 }
 
+/// Layer the CLI's default variables under the caller's, for a new agent.
+///
+/// `SHELL` is a stopgap: the VM's session runner wraps every command in
+/// `bash -c`, and bash self-assigns `$SHELL` without exporting it — so the
+/// variable reads as set from a shell prompt but is invisible to child
+/// processes. Codex desktop's remote bootstrap probes it from a `sh -c`
+/// wrapper and refuses to start when it's empty, which a GUI surfaces as a
+/// bare "SSH connection failed". A create-time variable lands in the VM's
+/// real environment, so it is exported everywhere. Only at create: variables
+/// don't reach an agent that already exists. A caller-supplied SHELL wins.
+/// Remove once vm-init exports SHELL itself.
+pub fn with_default_variables(variables: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    let mut map = match variables {
+        None => serde_json::Map::new(),
+        Some(serde_json::Value::Object(map)) => map,
+        // Never produced by our callers (variables come from string maps);
+        // reshaping someone else's value is worse than leaving it alone.
+        Some(other) => return Some(other),
+    };
+    map.entry("SHELL")
+        .or_insert_with(|| serde_json::Value::String("/bin/bash".to_owned()));
+    Some(serde_json::Value::Object(map))
+}
+
 /// Create an agent. The VM only — no harness, no credential, no session.
 /// Provisioning belongs to whatever opens a session on it, so an agent created
 /// here works with any of them.
@@ -207,7 +235,7 @@ pub async fn create(
             input: mutations::cloud_agent_create::CloudAgentCreateInput {
                 environment_id: environment_id.to_owned(),
                 name,
-                variables,
+                variables: with_default_variables(variables),
             },
         },
     )
@@ -278,7 +306,8 @@ pub async fn wait_until_running(
     environment_id: &str,
     id: &str,
 ) -> Result<Agent> {
-    let deadline = std::time::Instant::now() + READY_TIMEOUT;
+    let started = std::time::Instant::now();
+    let deadline = started + READY_TIMEOUT;
     loop {
         let agent = match get(client, backboard, environment_id, id).await? {
             Some(agent) => agent,
@@ -300,39 +329,12 @@ pub async fn wait_until_running(
                 agent.status.label()
             );
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
-}
-
-/// Bring an existing agent up to RUNNING, waking it if it is asleep.
-///
-/// Deliberately unlike the launcher's [`crate::commands::code`] path, which
-/// treats a crashed agent as a cue to create a fresh one. That is a reasonable
-/// answer to "get me coding" and a terrible answer to "wake this agent": the
-/// caller named a machine, and silently handing back a different, empty one
-/// while the original's disk sits there is not a thing to do quietly.
-pub async fn ensure_running(
-    client: &reqwest::Client,
-    backboard: &str,
-    agent: &Agent,
-) -> Result<Agent> {
-    match agent.status {
-        Status::Running => Ok(agent.clone()),
-        // STARTING means something else is already booting it, so this waits
-        // rather than issuing a second wake.
-        Status::Starting => {
-            wait_until_running(client, backboard, &agent.environment_id, &agent.id).await
-        }
-        Status::Sleeping => {
-            wake(client, backboard, &agent.id).await?;
-            wait_until_running(client, backboard, &agent.environment_id, &agent.id).await
-        }
-        _ => bail!(
-            "Agent {} is {} — it cannot be connected to. `railway ca delete {}` and create a new one.",
-            agent.name,
-            agent.status.label(),
-            agent.name
-        ),
+        let interval = if started.elapsed() < POLL_FAST_WINDOW {
+            POLL_INTERVAL_FAST
+        } else {
+            POLL_INTERVAL
+        };
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -403,6 +405,31 @@ pub async fn resolve(
     selector: Option<&str>,
     environment_id: Option<&str>,
 ) -> Result<(Agent, Resolution)> {
+    match resolve_or_none(configs, client, selector, environment_id).await? {
+        Some(found) => Ok(found),
+        None => bail!(
+            "You have no cloud agents{}. Create one with `railway ca create`.",
+            match environment_id {
+                Some(_) => " in this environment",
+                None => "",
+            }
+        ),
+    }
+}
+
+/// [`resolve`], with the empty account handed back instead of an error.
+///
+/// `None` means exactly "no live agents in scope, and no name was given" —
+/// the one case where a caller can reasonably do something other than fail,
+/// e.g. a connect command creating the first agent. Every other outcome
+/// (a named agent missing, more than one candidate) is still an error here,
+/// because acting on a guess would touch the wrong machine.
+pub async fn resolve_or_none(
+    configs: &Configs,
+    client: &reqwest::Client,
+    selector: Option<&str>,
+    environment_id: Option<&str>,
+) -> Result<Option<(Agent, Resolution)>> {
     let backboard = configs.get_backboard();
     let candidates = match environment_id {
         Some(env) => list_in_environment(client, &backboard, env, true).await?,
@@ -410,7 +437,7 @@ pub async fn resolve(
     };
 
     if let Some(selector) = selector {
-        return match_selector(candidates, selector).map(|agent| (agent, Resolution::Named));
+        return match_selector(candidates, selector).map(|agent| Some((agent, Resolution::Named)));
     }
 
     let live: Vec<Agent> = candidates
@@ -426,21 +453,15 @@ pub async fn resolve(
         .cloned()
         .collect();
     if remembered.len() == 1 {
-        return Ok((remembered.remove(0), Resolution::Remembered));
+        return Ok(Some((remembered.remove(0), Resolution::Remembered)));
     }
 
     match live.len() {
-        0 => bail!(
-            "You have no cloud agents{}. Create one with `railway ca create`.",
-            match environment_id {
-                Some(_) => " in this environment",
-                None => "",
-            }
-        ),
-        1 => Ok((
+        0 => Ok(None),
+        1 => Ok(Some((
             live.into_iter().next().expect("len checked"),
             Resolution::Sole,
-        )),
+        ))),
         _ => bail!(
             "You have {} cloud agents and none is this directory's. Name one:\n{}",
             live.len(),
@@ -574,6 +595,25 @@ mod tests {
         assert!(!Status::Failed.is_live());
         assert!(!Status::Deleting.is_live());
         assert!(!Status::Unknown("wat".into()).is_live());
+    }
+
+    #[test]
+    fn shell_is_seeded_when_absent() {
+        // No variables at all still yields SHELL — Codex's remote bootstrap
+        // dies without it, and this is the only moment it can be set.
+        let vars = with_default_variables(None).unwrap();
+        assert_eq!(vars["SHELL"], "/bin/bash");
+
+        let vars = with_default_variables(Some(serde_json::json!({ "FOO": "bar" }))).unwrap();
+        assert_eq!(vars["SHELL"], "/bin/bash");
+        assert_eq!(vars["FOO"], "bar");
+    }
+
+    #[test]
+    fn a_callers_shell_wins_over_the_default() {
+        let vars =
+            with_default_variables(Some(serde_json::json!({ "SHELL": "/bin/zsh" }))).unwrap();
+        assert_eq!(vars["SHELL"], "/bin/zsh");
     }
 
     #[test]

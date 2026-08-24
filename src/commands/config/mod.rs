@@ -1,3 +1,4 @@
+mod migrate;
 mod runner;
 
 use std::{
@@ -40,6 +41,9 @@ enum Command {
 
     /// Import the linked Railway project's current configuration into .railway/railway.ts
     Pull(PullArgs),
+
+    /// Translate railway.json / railway.toml into .railway/railway.ts
+    Migrate(migrate::MigrateArgs),
 }
 
 #[derive(Parser, Clone)]
@@ -68,7 +72,7 @@ struct SharedArgs {
     #[clap(long)]
     include_types: bool,
 
-    /// Path to the TypeScript configuration runner. Defaults to RAILWAY_IAC_TS_BIN or railway-iac-ts.
+    /// Optional TypeScript runner binary. When set, plan/apply use railway-iac-ts instead of the CLI engine.
     #[clap(long)]
     runner: Option<String>,
 
@@ -121,7 +125,7 @@ struct PullArgs {
     #[clap(long)]
     json: bool,
 
-    /// Path to the TypeScript configuration runner. Defaults to RAILWAY_IAC_TS_BIN or railway-iac-ts.
+    /// Optional TypeScript runner binary. When set, plan/apply use railway-iac-ts instead of the CLI engine.
     #[clap(long)]
     runner: Option<String>,
 
@@ -171,6 +175,7 @@ pub async fn command(args: Args) -> Result<()> {
         }
         Command::Init(args) => init_config(args).await,
         Command::Pull(args) => pull_config(args).await,
+        Command::Migrate(args) => migrate::migrate_config(args).await,
     }
 }
 
@@ -1510,10 +1515,21 @@ async fn ensure_config_initialized(args: &SharedArgs) -> Result<()> {
     }
 
     let cwd = std::env::current_dir().context("Unable to get current directory")?;
-    let railway_file = cwd.join(".railway").join("railway.ts");
-    if railway_file.exists() {
+    let found = find_railway_files(&cwd);
+    if found.len() > 1 {
+        bail!(
+            "Multiple Railway configuration files found ({}). Keep only one of .railway/railway.{{ts,py,go}}.",
+            found
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !found.is_empty() {
         return Ok(());
     }
+    let railway_file = cwd.join(".railway").join("railway.ts");
 
     println!();
     println!("{}", "Railway configuration is not initialized yet.".bold());
@@ -1540,6 +1556,38 @@ async fn ensure_config_initialized(args: &SharedArgs) -> Result<()> {
     init_config(InitArgs { force: false }).await?;
     println!();
     Ok(())
+}
+
+fn find_railway_file(start: &Path) -> Option<PathBuf> {
+    find_railway_files(start).into_iter().next()
+}
+
+/// Discover IaC authoring files (`.ts` / `.py` / `.go`). Prefer a single file;
+/// when multiple exist, callers should error.
+fn find_railway_files(start: &Path) -> Vec<PathBuf> {
+    const NAMES: &[&str] = &["railway.ts", "railway.py", "railway.go"];
+    for directory in start.ancestors() {
+        let mut found = Vec::new();
+        let railway_dir =
+            if directory.file_name().and_then(|name| name.to_str()) == Some(".railway") {
+                directory.to_path_buf()
+            } else {
+                directory.join(".railway")
+            };
+        if !railway_dir.is_dir() {
+            continue;
+        }
+        for name in NAMES {
+            let candidate = railway_dir.join(name);
+            if candidate.is_file() {
+                found.push(candidate);
+            }
+        }
+        if !found.is_empty() {
+            return found;
+        }
+    }
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -1617,6 +1665,31 @@ mod tests {
 
         assert!(!remove_generated_legacy_skill(&cwd, &hash).unwrap());
         assert!(outside.exists());
+    }
+
+    #[test]
+    fn config_discovery_works_from_project_root_and_railway_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let railway_dir = root.path().join(".railway");
+        fs::create_dir_all(&railway_dir).unwrap();
+        let config = railway_dir.join("railway.ts");
+        fs::write(&config, "export default {};").unwrap();
+
+        assert_eq!(find_railway_file(root.path()), Some(config.clone()));
+        assert_eq!(find_railway_file(&railway_dir), Some(config));
+    }
+
+    #[test]
+    fn config_discovery_walks_up_from_nested_project_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let railway_dir = root.path().join(".railway");
+        let nested = root.path().join("src").join("Backend.Api");
+        fs::create_dir_all(&railway_dir).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        let config = railway_dir.join("railway.ts");
+        fs::write(&config, "export default {};").unwrap();
+
+        assert_eq!(find_railway_file(&nested), Some(config));
     }
 
     fn service_resource(

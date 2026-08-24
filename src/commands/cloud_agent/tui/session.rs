@@ -41,18 +41,121 @@ pub fn durable_name(harness: &str) -> String {
     format!("{harness}-{suffix}")
 }
 
-/// Read the environment back out of a relay target (`agent:<env>:<agent>`).
+/// The reply to a device-status-report cursor-position query (`ESC[6n`),
+/// found anywhere in a chunk of remote output — `Some` iff the query is
+/// there.
 ///
-/// Returns `None` for anything else rather than guessing: the caller uses this
-/// to pick a machine to flush and suspend, and a target shape we don't
-/// recognise is not one to act on.
-fn environment_from_target(target: &str) -> Option<&str> {
-    match *target.split(':').collect::<Vec<_>>().as_slice() {
-        ["agent", environment, agent] if !environment.is_empty() && !agent.is_empty() => {
-            Some(environment)
+/// The query is how a program without a trustworthy `ioctl` answer (this
+/// pane's remote side is a real pty, but a program can still choose to probe
+/// rather than assume) works out where the cursor already is; some terminal
+/// setup code — `railway-agent-tui`'s among them — sends it and blocks on a
+/// reply before drawing anything. The query lives entirely inside the byte
+/// stream this emulator parses: nothing forwards it to the real terminal this
+/// pane itself is drawn in, so unless the emulator answers on the query's
+/// behalf, the remote program hangs until it gives up. `ESC[row;colR`,
+/// 1-indexed, is what a real terminal would have sent back — read off the
+/// emulator's own idea of the cursor position after this chunk lands, so it
+/// reflects everything the chunk itself just drew.
+fn dsr_reply(chunk: &[u8], screen: &vt100::Screen) -> Option<Vec<u8>> {
+    const QUERY: &[u8] = b"\x1b[6n";
+    chunk.windows(QUERY.len()).any(|w| w == QUERY).then(|| {
+        let (row, col) = screen.cursor_position();
+        format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
+    })
+}
+
+/// The reply to a primary-device-attributes query (`ESC[c`, or `ESC[0c` with
+/// the parameter spelled out), found anywhere in a chunk — `Some` iff the
+/// query is there.
+///
+/// The other query that blocks the program which sent it, and the one that
+/// stopped `railway-agent-tui` drawing at all. crossterm uses DA1 as the
+/// sentinel in `supports_keyboard_enhancement`: it writes the kitty query and
+/// a DA1 immediately after, then reads until one of them comes back, on the
+/// reasoning that a terminal too old to know the kitty query will still answer
+/// DA1. So answering the kitty query while ignoring DA1 is the single worst
+/// combination available — the harness learns the reply it is waiting for will
+/// never arrive, and waits anyway. That is exactly what this pane started
+/// doing when it learned to answer `ESC[?u`: the launch went from drawing
+/// after a two-second timeout to never drawing at all, leaving a pane with
+/// nothing in it but the relay's banner. Answering both retires the timeout
+/// too — startup goes from ~2s to immediate.
+///
+/// `62;22` claims a VT220 that does ANSI colour, which is the least this
+/// emulator is. Secondary DA (`ESC[>c`) is deliberately not answered: nothing
+/// here asks for it, and inventing a version string for a terminal that does
+/// not exist invites feature detection nobody can honour.
+fn da1_reply(chunk: &[u8]) -> Option<Vec<u8>> {
+    const REPLY: &[u8] = b"\x1b[?62;22c";
+    let mut i = 0;
+    while let Some(at) = chunk[i..].windows(2).position(|w| w == b"\x1b[") {
+        let seq = &chunk[i + at + 2..];
+        // A query carries no parameters or the single default `0`. Anything
+        // else ending in `c` is a different sequence — and `ESC[?…c` is a
+        // terminal's own reply, never a request, so a leading `?` is not one.
+        let query = match seq.first() {
+            Some(b'c') => true,
+            Some(b'0') => seq.get(1) == Some(&b'c'),
+            _ => false,
+        };
+        if query {
+            return Some(REPLY.to_vec());
         }
-        _ => None,
+        // Step past the introducer only, like `kitty_scan`: a later `c` may
+        // belong to plain text, and skipping to it would jump real sequences.
+        i += at + 2;
     }
+    None
+}
+
+/// Track and answer the kitty keyboard protocol inside the pane's stream.
+///
+/// A harness that wants unambiguous keys (shift+enter as a newline, most
+/// visibly) queries with `CSI ? u`, and only enables the protocol when a
+/// reply comes back — which, inside this emulator, nothing sent until now,
+/// so every harness fell back to legacy keys where shift+enter and enter are
+/// the same byte. Answering the query (with the current flags) and watching
+/// for the push (`CSI > flags u`) / pop (`CSI < u`) that follow lets
+/// [`Session::send_key`] know when the modified-Enter CSI-u encodings will
+/// be understood on the far side.
+///
+/// Scanning is chunk-wise, like [`dsr_reply`]: a sequence split across two
+/// reads is missed, which costs one retry of a query, not correctness.
+fn kitty_scan(chunk: &[u8], kitty: &AtomicBool) -> Option<Vec<u8>> {
+    let mut reply = None;
+    let mut i = 0;
+    while let Some(at) = chunk[i..].windows(2).position(|w| w == b"\x1b[") {
+        let seq = &chunk[i + at + 2..];
+        let Some(end) = seq.iter().position(|b| *b == b'u') else {
+            break;
+        };
+        match seq.first() {
+            // Query: answer with the flags in effect, like a real terminal.
+            Some(b'?') if seq[1..end].iter().all(u8::is_ascii_digit) => {
+                let flags = u8::from(kitty.load(Ordering::Relaxed));
+                reply = Some(format!("\x1b[?{flags}u").into_bytes());
+            }
+            // Push: the protocol is on iff any flag bit is set.
+            Some(b'>') if seq[1..end].iter().all(u8::is_ascii_digit) => {
+                let flags: u32 = std::str::from_utf8(&seq[1..end])
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                kitty.store(flags != 0, Ordering::Relaxed);
+            }
+            // Pop: back to legacy keys. One level of depth is all the
+            // harnesses use; a counter would be pretending to more fidelity
+            // than chunk-wise scanning has anyway.
+            Some(b'<') if seq[1..end].iter().all(u8::is_ascii_digit) => {
+                kitty.store(false, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        // Step past the introducer only: the found `u` may belong to plain
+        // text far ahead, and skipping there would jump over real sequences.
+        i += at + 2;
+    }
+    reply
 }
 
 /// A running `ssh` under a pty, plus the emulator that makes sense of it.
@@ -70,12 +173,32 @@ pub struct Session {
     pub identity: Option<std::path::PathBuf>,
     pub relay_opts: Vec<String>,
     parser: Arc<Mutex<vt100::Parser>>,
-    writer: Box<dyn Write + Send>,
+    /// Shared with the reader thread, which also writes to it — a synthetic
+    /// cursor-position reply (see [`dsr_reply`]) has to go back over the same
+    /// pty the keyboard does, and `take_writer` can only be called once.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     /// Set by the reader thread when ssh's output ends — the session is over
     /// even though the child may take another moment to reap.
     ended: Arc<AtomicBool>,
+    /// Whether ssh exited cleanly, once its status has been collected — the
+    /// difference between "the harness finished" (0: the pane can close) and
+    /// "the connection dropped" (anything else: the pane stays for the
+    /// recovery keys). `None` until waitpid has it; see
+    /// [`Self::exit_success`], which fills this exactly once.
+    exit_status: Option<bool>,
+    /// This pane attached to a session that already existed, rather than
+    /// starting one. Only an attach can go silent (see [`Self::stalled`]).
+    reattach: bool,
+    /// When the pane connected, for the stall clock.
+    spawned_at: std::time::Instant,
+    /// Set by the reader thread on the first byte. An attach that never sets
+    /// this is talking to a session whose process is gone.
+    got_output: Arc<AtomicBool>,
+    /// The remote program pushed the kitty keyboard protocol (see
+    /// [`kitty_scan`]), so modified Enter goes out CSI-u encoded.
+    kitty_keys: Arc<AtomicBool>,
     /// Last size pushed to the pty, so a redraw at the same size is free.
     size: (u16, u16),
     /// Rows scrolled back from the live view. Typing snaps back to 0 — nobody
@@ -84,11 +207,13 @@ pub struct Session {
 }
 
 impl Session {
-    /// The environment this session's agent lives in. The relay target is the
-    /// only place the pane carries it, and sleeping the agent needs it to flush
-    /// the disk first.
-    pub fn environment_id(&self) -> Option<&str> {
-        environment_from_target(&self.ssh_target)
+    /// Write straight to the pty — keystrokes, pointer reports, and the
+    /// reader thread's own DSR replies all go through this one shared writer.
+    fn write_raw(&self, bytes: &[u8]) {
+        if let Ok(mut writer) = self.writer.lock() {
+            let _ = writer.write_all(bytes);
+            let _ = writer.flush();
+        }
     }
 
     /// Spawn `ssh` under a pty and start reading it.
@@ -171,26 +296,51 @@ impl Session {
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 4000)));
         let ended = Arc::new(AtomicBool::new(false));
+        let got_output = Arc::new(AtomicBool::new(false));
+        let kitty_keys = Arc::new(AtomicBool::new(false));
         let mut reader = pty
             .master
             .try_clone_reader()
             .context("Failed to read the agent session")?;
-        let writer = pty
-            .master
-            .take_writer()
-            .context("Failed to write to the agent session")?;
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(
+            pty.master
+                .take_writer()
+                .context("Failed to write to the agent session")?,
+        ));
 
         {
             let parser = parser.clone();
             let ended = ended.clone();
+            let writer = writer.clone();
+            let got_output = got_output.clone();
+            let kitty_keys = kitty_keys.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            if let Ok(mut parser) = parser.lock() {
+                            got_output.store(true, Ordering::Relaxed);
+                            let mut replies =
+                                kitty_scan(&buf[..n], &kitty_keys).unwrap_or_default();
+                            // In the order they were asked: a harness reads the
+                            // replies back as a stream, and DA1 is the sentinel
+                            // that says the kitty answer before it was the whole
+                            // answer.
+                            if let Some(da1) = da1_reply(&buf[..n]) {
+                                replies.extend_from_slice(&da1);
+                            }
+                            if let Some(dsr) = parser.lock().ok().and_then(|mut parser| {
                                 parser.process(&buf[..n]);
+                                dsr_reply(&buf[..n], parser.screen())
+                            }) {
+                                replies.extend_from_slice(&dsr);
+                            }
+                            if !replies.is_empty() {
+                                if let Ok(mut writer) = writer.lock() {
+                                    let _ = writer.write_all(&replies);
+                                    let _ = writer.flush();
+                                }
                             }
                             notify();
                         }
@@ -214,13 +364,98 @@ impl Session {
             child,
             master: pty.master,
             ended,
+            exit_status: None,
+            reattach,
+            spawned_at: std::time::Instant::now(),
+            got_output,
+            kitty_keys,
             size: (rows, cols),
             scroll: 0,
         })
     }
 
+    /// How long an attach may stay silent before the pane says so.
+    pub const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// An attach that has produced nothing, for long enough to say so.
+    ///
+    /// Only reattaches count: a fresh launch always prints (provisioning, the
+    /// harness banner), so silence there is just a slow start. An attach is
+    /// silent exactly when the durable session's process is gone — the relay
+    /// resolves the name, streams nothing, and never will. The platform can
+    /// keep reporting such a session as running after its agent slept, so
+    /// this is the pane's own way of noticing.
+    pub fn stalled(&self) -> bool {
+        self.reattach
+            && !self.got_output.load(Ordering::Relaxed)
+            && !self.ended()
+            && self.spawned_at.elapsed() >= Self::STALL_AFTER
+    }
+
+    /// Time until [`Self::stalled`] would first flip, so the event loop can
+    /// schedule one redraw for it. `None` when it can't stall or already has.
+    pub fn stall_remaining(&self) -> Option<std::time::Duration> {
+        if !self.reattach || self.got_output.load(Ordering::Relaxed) || self.ended() {
+            return None;
+        }
+        Self::STALL_AFTER.checked_sub(self.spawned_at.elapsed())
+    }
+
+    /// How long this pane has been open. The tree uses it to tell the status
+    /// projection's normal lag apart from an agent that is genuinely stuck —
+    /// see `displayed_status`.
+    pub fn open_for(&self) -> std::time::Duration {
+        self.spawned_at.elapsed()
+    }
+
     pub fn ended(&self) -> bool {
         self.ended.load(Ordering::Relaxed)
+    }
+
+    /// The remote command ran to completion: ssh exited 0, which a pane-style
+    /// launch only does once the harness has exited and the reset has run.
+    /// This is "the work here is over" — the pane can close on it. A dropped
+    /// connection — relay death, an idle NAT timeout, a kill — exits nonzero
+    /// instead and is *not* finished: that pane stays up for the recovery
+    /// keys, because the durable session it was showing is still running.
+    pub fn finished(&mut self) -> bool {
+        self.ended() && self.exit_success() == Some(true)
+    }
+
+    /// Ended, but ssh's exit status hasn't been collected yet — the pty's EOF
+    /// can beat waitpid by a beat. The event loop polls briefly while any
+    /// pane is in this state, so the finished/dropped call isn't lost to the
+    /// race.
+    pub fn awaiting_exit_status(&self) -> bool {
+        self.ended() && self.exit_status.is_none()
+    }
+
+    /// ssh's exit, collected once and remembered. `None` while the status
+    /// isn't available yet; a wait that errors counts as "not clean", which
+    /// keeps the pane — the conservative wrong answer.
+    fn exit_success(&mut self) -> Option<bool> {
+        if self.exit_status.is_none() {
+            self.exit_status = match self.child.try_wait() {
+                Ok(None) => None,
+                Ok(Some(status)) => Some(status.success()),
+                Err(_) => Some(false),
+            };
+        }
+        self.exit_status
+    }
+
+    /// The environment this session's agent lives in, read back out of the
+    /// relay target (`agent:<environment>:<agent>`) it connected with.
+    ///
+    /// Reconnecting after a drop needs it — `connect_info` resolves the relay
+    /// plumbing from environment and agent — and the target is the one place
+    /// the session still carries it.
+    pub fn environment_id(&self) -> Option<String> {
+        let mut parts = self.ssh_target.split(':');
+        match (parts.next()?, parts.next()) {
+            ("agent", Some(env)) if !env.is_empty() => Some(env.to_string()),
+            _ => None,
+        }
     }
 
     /// Resize both the emulator and the pty. Doing only one leaves the agent
@@ -233,14 +468,11 @@ impl Session {
         }
         self.size = (rows, cols);
         if let Ok(mut parser) = self.parser.lock() {
-            parser.set_size(rows, cols);
-            // A smaller pane means a lower ceiling; an offset held over from a
-            // taller one would underflow inside the emulator.
-            let ceiling = rows.saturating_sub(1) as usize;
-            if self.scroll > ceiling {
-                self.scroll = ceiling;
-                parser.set_scrollback(ceiling);
-            }
+            parser.screen_mut().set_size(rows, cols);
+            // Resizing can reflow rows between the screen and history; read
+            // the offset back so the held position stays whatever the
+            // emulator says the view now is.
+            self.scroll = parser.screen().scrollback();
         }
         let _ = self.master.resize(PtySize {
             rows,
@@ -309,7 +541,7 @@ impl Session {
                         index = Some(text.chars().count());
                     }
                     match screen.cell(r, c).map(|cell| cell.contents()) {
-                        Some(s) if !s.is_empty() => text.push_str(&s),
+                        Some(s) if !s.is_empty() => text.push_str(s),
                         // Empty, or a wide character's second cell: still a
                         // column.
                         _ => text.push(' '),
@@ -362,34 +594,24 @@ impl Session {
         if !wanted {
             return false;
         }
-        // `write_all`, not `send`: this is not typing, and it must not cancel a
+        // Not through `send`: this is not typing, and it must not cancel a
         // scrollback the way a keystroke does.
-        let _ = self.writer.write_all(&pointer_report(kind, at, encoding));
-        let _ = self.writer.flush();
+        self.write_raw(&pointer_report(kind, at, encoding));
         true
     }
 
     /// Scroll back through the emulator's history.
     ///
-    /// Clamped to the screen height, which is a limit of the emulator rather
-    /// than a choice: vt100 0.15 composes the scrolled view as
-    /// `scrollback[len-offset..] ++ rows[..rows_len-offset]`, so an offset past
-    /// the number of screen rows underflows that second subtraction. In debug
-    /// that panics; in release it wraps to a huge `take` and quietly renders
-    /// the live screen — which is what "scrolling does nothing" looked like.
-    ///
-    /// One screenful of history at a time, therefore. Going further back needs
-    /// a newer vt100, which currently conflicts with ratatui's pinned
-    /// `unicode-width`.
+    /// The only ceiling is the history that actually exists: the emulator
+    /// clamps the offset to it, so ask for the position and read back where
+    /// it settled. (vt100 0.15 could not compose a view more than one screen
+    /// deep — a clamp used to sit here working around that.)
     pub fn scroll_by(&mut self, delta: isize) {
         let Ok(mut parser) = self.parser.lock() else {
             return;
         };
-        let ceiling = self.size.0.saturating_sub(1) as isize;
-        let wanted = (self.scroll as isize + delta).clamp(0, ceiling.max(0)) as usize;
-        parser.set_scrollback(wanted);
-        // It also clamps to the history that exists, so read back what it
-        // settled on rather than trusting the request.
+        let wanted = (self.scroll as isize).saturating_add(delta).max(0) as usize;
+        parser.screen_mut().set_scrollback(wanted);
         self.scroll = parser.screen().scrollback();
     }
 
@@ -430,8 +652,7 @@ impl Session {
             }
             // Not through `send`: this is not typing, and it must not snap the
             // view back to live.
-            let _ = self.writer.write_all(&out);
-            let _ = self.writer.flush();
+            self.write_raw(&out);
             return;
         }
         if alternate {
@@ -451,7 +672,7 @@ impl Session {
         }
         self.scroll = 0;
         if let Ok(mut parser) = self.parser.lock() {
-            parser.set_scrollback(0);
+            parser.screen_mut().set_scrollback(0);
         }
     }
 
@@ -467,14 +688,24 @@ impl Session {
     pub fn send(&mut self, bytes: &[u8]) {
         // Typing is a statement of intent to be at the bottom.
         self.scroll_to_live();
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        self.write_raw(bytes);
     }
 
     pub fn send_key(&mut self, key: KeyEvent) {
-        if let Some(bytes) = encode_key(key) {
+        if let Some(bytes) = encode_key_for(key, self.kitty_keys.load(Ordering::Relaxed)) {
             self.send(&bytes);
         }
+    }
+
+    /// Forward pasted text as a paste, not as typed keys. When the program in
+    /// the pane has bracketed paste switched on (Claude Code and every modern
+    /// editor do), the text goes wrapped in the paste markers and lands as one
+    /// atomic paste — a newline stays a newline instead of hitting Enter. A
+    /// program that never asked for the mode (a plain shell) gets the bare
+    /// text, exactly what a real terminal would send it.
+    pub fn send_paste(&mut self, text: &str) {
+        let bracketed = self.with_screen(|s| s.bracketed_paste()).unwrap_or(false);
+        self.send(&encode_paste(text, bracketed));
     }
 
     /// Stop the local half. The agent and whatever it is running stay up on the
@@ -526,6 +757,26 @@ fn url_in(line: &str, col: usize) -> Option<String> {
 
 #[cfg(test)]
 impl Session {
+    /// Put the session in the state [`Self::finished`] looks for: reader
+    /// done, ssh exited clean.
+    pub fn end_for_test(&mut self) {
+        self.ended.store(true, Ordering::Relaxed);
+        self.exit_status = Some(true);
+    }
+
+    /// Ended with a nonzero exit — the shape of a dropped connection.
+    pub fn end_dropped_for_test(&mut self) {
+        self.ended.store(true, Ordering::Relaxed);
+        self.exit_status = Some(false);
+    }
+
+    /// Flip the session to ended without waiting for its process to die —
+    /// the reader thread races a test that killed `cat`, and the state under
+    /// test is "the connection is gone", not how it went.
+    pub fn mark_ended(&self) {
+        self.ended.store(true, Ordering::Relaxed);
+    }
+
     /// A session backed by a local `cat` instead of ssh, so the state machine
     /// around sessions can be tested without a relay or a network.
     pub fn for_test(agent_id: &str, agent_name: &str) -> Result<Self> {
@@ -543,7 +794,8 @@ impl Session {
         let child = pty.slave.spawn_command(command)?;
         drop(pty.slave);
         let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 4000)));
-        let writer = pty.master.take_writer()?;
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(pty.master.take_writer()?));
 
         // The same reader the real session runs. Without it the emulator never
         // sees a byte, and a test against this fixture would be testing
@@ -576,6 +828,11 @@ impl Session {
             child,
             master: pty.master,
             ended: Arc::new(AtomicBool::new(false)),
+            exit_status: None,
+            reattach: false,
+            spawned_at: std::time::Instant::now(),
+            got_output: Arc::new(AtomicBool::new(true)),
+            kitty_keys: Arc::new(AtomicBool::new(false)),
             size: (24, 80),
             scroll: 0,
         })
@@ -659,6 +916,46 @@ fn wheel_report(up: bool, at: (u16, u16), encoding: vt100::MouseProtocolEncoding
     }
 }
 
+/// [`encode_key`], plus the encodings that only exist once the remote side
+/// has pushed the kitty keyboard protocol (see [`kitty_scan`]).
+///
+/// Modified Enter is the whole reason this split exists: legacy terminals
+/// send `\r` for shift+enter, ctrl+enter and plain enter alike, which is why
+/// shift+enter never made a newline in a harness. The CSI-u form says which
+/// one it was — but only to a program expecting it, so it is sent only after
+/// the push. Anything else would read the escape sequence as typed text.
+///
+/// Separate from `Session` so the choice is testable without a pty: Windows'
+/// ConPTY interprets escape sequences instead of forwarding them, so a
+/// round-trip test can only run on unix.
+fn encode_key_for(key: KeyEvent, kitty: bool) -> Option<Vec<u8>> {
+    if kitty
+        && key.code == KeyCode::Enter
+        && key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
+    {
+        // The kitty modifier field is a 1-based bitfield: shift 1, alt 2,
+        // ctrl 4. 13 is Enter's codepoint.
+        let m = 1
+            + u8::from(key.modifiers.contains(KeyModifiers::SHIFT))
+            + 2 * u8::from(key.modifiers.contains(KeyModifiers::ALT))
+            + 4 * u8::from(key.modifiers.contains(KeyModifiers::CONTROL));
+        return Some(format!("\x1b[13;{m}u").into_bytes());
+    }
+    // Without the push the CSI-u form would land as typed text, so ⇧enter falls
+    // back to meta+enter — `ESC CR`, the newline chord harnesses have always
+    // taken, and the exact bytes Claude Code's own `/terminal-setup` binds
+    // shift+enter to. A bare `\r` submits the half-written prompt, the one
+    // outcome the chord exists to prevent, so guessing newline is the better
+    // way to be wrong. ⌥enter already encodes this way through `encode_key`'s
+    // Alt prefix; this puts ⇧enter alongside it.
+    if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
+        return Some(b"\x1b\r".to_vec());
+    }
+    encode_key(key)
+}
+
 /// Encode a key event as the bytes a terminal would send.
 ///
 /// Enough of xterm's vocabulary for a coding agent: text, the control chords
@@ -730,12 +1027,139 @@ pub fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Encode pasted text as the bytes a terminal would send — wrapped in the
+/// bracketed-paste markers when the program on the pty has the mode on, bare
+/// otherwise.
+pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    // A paste containing the end marker would terminate the paste early and
+    // feed the remainder through as keystrokes — the classic bracketed-paste
+    // injection. Real terminals strip it; so does this pane. It is stripped
+    // from an unbracketed paste too: that path is keystrokes, and no keyboard
+    // produces the sequence.
+    let text = text.replace("\x1b[201~", "");
+    // Enter arrives from a keyboard as CR, and programs reading a pty expect
+    // the same from a paste; LF-only text would land as ^J.
+    let text = text.replace("\r\n", "\r").replace('\n', "\r");
+    if !bracketed {
+        return text.into_bytes();
+    }
+    let mut bytes = Vec::with_capacity(text.len() + 12);
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// The kitty keyboard protocol dance, as a harness does it: query, get
+    /// an answer, push, and only then is modified Enter CSI-u encoded.
+    #[test]
+    fn kitty_query_push_and_pop_are_tracked() {
+        let kitty = AtomicBool::new(false);
+
+        // The query gets the current flags back — none yet.
+        let reply = kitty_scan(b"setup\x1b[?u more", &kitty);
+        assert_eq!(reply.as_deref(), Some(b"\x1b[?0u".as_slice()));
+        assert!(!kitty.load(Ordering::Relaxed));
+
+        // Push turns it on; the next query reports it.
+        assert_eq!(kitty_scan(b"\x1b[>1u", &kitty), None);
+        assert!(kitty.load(Ordering::Relaxed));
+        let reply = kitty_scan(b"\x1b[?u", &kitty);
+        assert_eq!(reply.as_deref(), Some(b"\x1b[?1u".as_slice()));
+
+        // A push of zero flags is legacy keys by another name.
+        kitty_scan(b"\x1b[>0u", &kitty);
+        assert!(!kitty.load(Ordering::Relaxed));
+
+        // Pop turns it off.
+        kitty_scan(b"\x1b[>1u", &kitty);
+        kitty_scan(b"\x1b[<1u", &kitty);
+        assert!(!kitty.load(Ordering::Relaxed));
+
+        // Ordinary output — including a stray `u` — changes nothing.
+        assert_eq!(kitty_scan(b"\x1b[38;5;2mgreen up\x1b[0m", &kitty), None);
+        assert!(!kitty.load(Ordering::Relaxed));
+    }
+
+    /// Shift+enter reaches the harness as a newline only via the kitty
+    /// encoding — legacy `\r` for every modified Enter is exactly the
+    /// ambiguity being fixed.
+    #[test]
+    fn modified_enter_is_csi_u_encoded_once_kitty_is_active() {
+        let enter = |m| KeyEvent::new(KeyCode::Enter, m);
+        let bytes = |key, kitty| encode_key_for(key, kitty).unwrap();
+
+        // Each modifier its own bit, and combinations sum.
+        assert_eq!(bytes(enter(KeyModifiers::SHIFT), true), b"\x1b[13;2u");
+        assert_eq!(bytes(enter(KeyModifiers::ALT), true), b"\x1b[13;3u");
+        assert_eq!(bytes(enter(KeyModifiers::CONTROL), true), b"\x1b[13;5u");
+        assert_eq!(
+            bytes(enter(KeyModifiers::SHIFT | KeyModifiers::CONTROL), true),
+            b"\x1b[13;6u"
+        );
+
+        // Unmodified Enter is `\r` either way: it is not ambiguous, and a
+        // harness reading CSI-u for it would never see a plain submit.
+        assert_eq!(bytes(enter(KeyModifiers::NONE), true), b"\r");
+        assert_eq!(bytes(enter(KeyModifiers::NONE), false), b"\r");
+
+        // No push, no CSI-u: to a legacy program the escape sequence is
+        // typed text, which is worse than the ambiguity it replaces. ⇧enter
+        // still must not submit, so it falls back to the legacy newline chord.
+        assert_eq!(bytes(enter(KeyModifiers::SHIFT), false), b"\x1b\r");
+        assert_eq!(bytes(enter(KeyModifiers::ALT), false), b"\x1b\r");
+        // Ctrl is not a newline in anyone's legacy vocabulary — leave it alone.
+        assert_eq!(bytes(enter(KeyModifiers::CONTROL), false), b"\r");
+
+        // Everything else routes through the legacy encoder untouched.
+        assert_eq!(bytes(key(KeyCode::Char('a')), true), b"a");
+        assert_eq!(bytes(key(KeyCode::Tab), true), b"\t");
+    }
+
+    /// Unix only: this needs an escape sequence to survive the trip through
+    /// the pty, and Windows' ConPTY interprets those for itself instead of
+    /// passing them along, so the emulator never sees what was sent. Plain
+    /// text round-trips fine, which is why the rest of these run everywhere.
+    #[cfg(unix)]
+    #[test]
+    fn the_kitty_encoding_goes_out_on_the_wire() {
+        let mut session = Session::for_test("ca", "test").unwrap();
+        session.kitty_keys.store(true, Ordering::Relaxed);
+        session.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        for _ in 0..40 {
+            if session
+                .with_screen(|s| s.contents().contains("[13;2u"))
+                .unwrap_or(false)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // `cat` echoes what it was sent, so the emulator shows the sequence
+        // (ESC swallowed) — proof the CSI-u bytes went out, not `\r`.
+        assert!(
+            session
+                .with_screen(|s| s.contents().contains("[13;2u"))
+                .unwrap_or(false),
+            "expected the kitty encoding on the wire"
+        );
+    }
+
+    /// Reconnecting resolves the relay plumbing from the environment, which
+    /// the session only holds inside its relay target.
+    #[test]
+    fn the_environment_is_read_back_out_of_the_relay_target() {
+        let session = Session::for_test("ca", "test").unwrap();
+        // for_test connects as agent:test:test.
+        assert_eq!(session.environment_id().as_deref(), Some("test"));
     }
 
     #[test]
@@ -781,6 +1205,28 @@ mod tests {
     fn keys_a_terminal_would_not_send_produce_nothing() {
         assert!(encode_key(key(KeyCode::Null)).is_none());
         assert!(encode_key(KeyEvent::new(KeyCode::CapsLock, KeyModifiers::NONE)).is_none());
+    }
+
+    /// A paste reaches the pty the way a real terminal would send it: marker-
+    /// wrapped when the program switched bracketed paste on, bare when it
+    /// never did, and newlines as CR either way — dictated text with a line
+    /// break must not hit Enter mid-thought.
+    #[test]
+    fn paste_encodes_for_the_mode_the_program_asked_for() {
+        assert_eq!(encode_paste("ship it", true), b"\x1b[200~ship it\x1b[201~");
+        assert_eq!(encode_paste("ship it", false), b"ship it");
+        assert_eq!(encode_paste("a\r\nb\nc", false), b"a\rb\rc");
+        assert_eq!(encode_paste("a\nb", true), b"\x1b[200~a\rb\x1b[201~");
+    }
+
+    /// The end marker cannot ride a paste out of its brackets and turn the
+    /// rest of the clipboard into live keystrokes.
+    #[test]
+    fn paste_cannot_smuggle_its_own_end_marker() {
+        assert_eq!(
+            encode_paste("safe\x1b[201~rm -rf /\r", true),
+            b"\x1b[200~saferm -rf /\r\x1b[201~"
+        );
     }
 
     #[test]
@@ -833,10 +1279,14 @@ mod tests {
         let mut session = Session::for_test("ca", "test").unwrap();
         session.resize(6, 60);
         session.send(b"open https://railway.com/deploy now\r\n");
+        // Wait for the whole URL, not just the host. A pty delivers the line in
+        // whatever chunks it likes, and "railway.com" is already on screen while
+        // the path is still arriving — which left the assertion below comparing
+        // against a truncated `…/dep` on a loaded runner.
         for _ in 0..40 {
             if session
                 .with_screen(|s| s.contents_between(0, 0, 0, u16::MAX))
-                .is_some_and(|line| line.contains("railway.com"))
+                .is_some_and(|line| line.contains("https://railway.com/deploy"))
             {
                 break;
             }
@@ -947,6 +1397,226 @@ mod tests {
         assert!(!session.scrolled_back());
     }
 
+    /// The whole retained history is reachable, not one screenful. The old
+    /// emulator could not compose a view deeper than the pane is tall, so a
+    /// clamp in `scroll_by` stopped exactly here — this is the regression
+    /// test for its removal.
+    #[test]
+    fn scrolling_reaches_the_whole_history() {
+        let mut session = Session::for_test("ca", "test").unwrap();
+        session.resize(6, 40);
+
+        for i in 0..120 {
+            session.send(format!("line-{i}\r\n").as_bytes());
+        }
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let seen = session
+                .with_screen(|screen| screen.contents().contains("line-119"))
+                .unwrap_or(false);
+            if seen {
+                break;
+            }
+        }
+
+        // Ask for infinitely far back; the emulator clamps to what exists.
+        session.scroll_by(isize::MAX);
+        assert!(
+            session.scroll > 100,
+            "120 lines through a 6-row pane should leave far more than one \
+             screen of history, got offset {}",
+            session.scroll
+        );
+        let top = session.with_screen(|s| s.contents()).unwrap();
+        assert!(
+            top.contains("line-0"),
+            "the very first line should be visible at full depth:\n{top}"
+        );
+
+        // And all the way forward again.
+        session.scroll_by(isize::MIN);
+        assert!(!session.scrolled_back());
+        let live = session.with_screen(|s| s.contents()).unwrap();
+        assert!(live.contains("line-119"), "back to the tail:\n{live}");
+    }
+
+    /// Successive wheel notches keep going past one screenful, through the
+    /// same entry point the mouse uses.
+    #[test]
+    fn scrolling_walks_past_one_screenful() {
+        let mut session = Session::for_test("ca", "test").unwrap();
+        session.resize(6, 40);
+
+        for i in 0..60 {
+            session.send(format!("line-{i}\r\n").as_bytes());
+        }
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let seen = session
+                .with_screen(|screen| screen.contents().contains("line-59"))
+                .unwrap_or(false);
+            if seen {
+                break;
+            }
+        }
+
+        // No mouse reporting and no alternate screen here, so each wheel goes
+        // to the emulator's own scrollback.
+        session.scroll(true, 5, (1, 1));
+        let one = session.scroll;
+        session.scroll(true, 5, (1, 1));
+        let two = session.scroll;
+        session.scroll(true, 5, (1, 1));
+        let three = session.scroll;
+        assert!(one < two && two < three, "each notch must go deeper");
+        assert!(
+            three > 6,
+            "three notches should pass the height of the pane, got {three}"
+        );
+
+        let deep = session.with_screen(|s| s.contents()).unwrap();
+        assert!(
+            !deep.contains("line-59"),
+            "the tail should have scrolled out of view:\n{deep}"
+        );
+    }
+
+    /// A deep offset survives the pane changing shape. Resize used to clamp
+    /// the offset to the new height because the old emulator would underflow
+    /// past it; now the offset just rides along.
+    #[test]
+    fn a_deep_scroll_survives_resize() {
+        let mut session = Session::for_test("ca", "test").unwrap();
+        session.resize(10, 40);
+
+        for i in 0..100 {
+            session.send(format!("line-{i}\r\n").as_bytes());
+        }
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let seen = session
+                .with_screen(|screen| screen.contents().contains("line-99"))
+                .unwrap_or(false);
+            if seen {
+                break;
+            }
+        }
+
+        session.scroll_by(60);
+        assert!(session.scroll > 10, "start well past one screen");
+
+        // Shrink, then grow. Either way the view must keep rendering — in
+        // debug builds an underflow inside the emulator would panic here.
+        session.resize(4, 40);
+        assert!(session.scrolled_back(), "the offset survives shrinking");
+        let shrunk = session.with_screen(|s| s.contents()).unwrap();
+        assert!(!shrunk.is_empty(), "a shrunk pane still renders history");
+
+        session.resize(20, 40);
+        let grown = session.with_screen(|s| s.contents()).unwrap();
+        assert!(!grown.is_empty(), "a grown pane still renders history");
+
+        // Typing is still the way back to live.
+        session.send(b"x");
+        assert!(!session.scrolled_back());
+    }
+
+    /// Scrolling, resizing, and live output all at once. None of these
+    /// operations may wedge the offset, wedge each other, or leave the view
+    /// unable to render — the wheel arrives whenever it arrives, not when the
+    /// pane is conveniently idle.
+    #[test]
+    fn scrollback_survives_churn() {
+        let mut session = Session::for_test("ca", "test").unwrap();
+        session.resize(8, 40);
+
+        // Interleave output with scrolls and reshapes, deterministically.
+        let sizes = [(4u16, 30u16), (12, 60), (6, 40), (24, 80), (8, 40)];
+        for (round, &(rows, cols)) in sizes.iter().enumerate() {
+            for i in 0..40 {
+                session.send(format!("round-{round}-line-{i}\r\n").as_bytes());
+            }
+            session.scroll_by(37);
+            session.resize(rows, cols);
+            session.scroll_by(-13);
+            let held = session.scroll;
+            let history = session
+                .with_screen(|s| s.scrollback())
+                .expect("the emulator stays lockable");
+            // The reader thread may process this round's echo between the
+            // scroll above and this read, and output arriving while scrolled
+            // back pins the view by pushing the emulator's offset deeper. So
+            // the emulator may run ahead of the held offset here — but it can
+            // never sit above it, which is the wedge this test is for.
+            assert!(
+                history >= held,
+                "the held offset never passes the emulator (held {held}, emulator {history})"
+            );
+            assert!(
+                session.with_screen(|s| s.contents()).is_some(),
+                "the view renders mid-churn"
+            );
+        }
+
+        // Wait for the tail so the final checks see settled history.
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let seen = session
+                .with_screen(|screen| screen.contents().contains("round-4-line-39"))
+                .unwrap_or(false);
+            if seen {
+                break;
+            }
+        }
+
+        session.scroll_by(isize::MAX);
+        let top = session.with_screen(|s| s.contents()).unwrap();
+        assert!(
+            top.contains("round-0-line-"),
+            "the first round is still reachable at full depth:\n{top}"
+        );
+        session.send(b"x");
+        assert!(!session.scrolled_back(), "typing still snaps back to live");
+    }
+
+    /// Past the emulator's retention the offset clamps to what is kept, and
+    /// the oldest lines are the ones to go — the view at full depth is the
+    /// start of the *retained* history, never garbage.
+    #[test]
+    fn scrollback_clamps_at_capacity() {
+        let mut session = Session::for_test("ca", "test").unwrap();
+        session.resize(6, 40);
+
+        // More than the 4000 lines the parser retains.
+        for i in 0..4200 {
+            session.send(format!("line-{i}\r\n").as_bytes());
+        }
+        for _ in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let seen = session
+                .with_screen(|screen| screen.contents().contains("line-4199"))
+                .unwrap_or(false);
+            if seen {
+                break;
+            }
+        }
+
+        session.scroll_by(isize::MAX);
+        assert_eq!(
+            session.scroll, 4000,
+            "full depth is the retention limit, no further"
+        );
+        let top = session.with_screen(|s| s.contents()).unwrap();
+        assert!(
+            !top.contains("line-0\r") && !top.contains("line-0\n"),
+            "the very first lines fell out of retention:\n{top}"
+        );
+        assert!(
+            top.contains("line-"),
+            "what is shown is still real history:\n{top}"
+        );
+    }
+
     /// An application that asked for mouse reporting gets a real wheel event,
     /// so its own viewport scrolls. Arrow keys were wrong here: a coding agent
     /// reads those as prompt history, so the wheel walked through old prompts.
@@ -1007,6 +1677,68 @@ mod tests {
         assert_eq!(legacy[3], 96, "button 64 plus the 32 offset");
         assert_eq!(legacy[4], 255, "clamped to the encodable maximum");
         assert_eq!(legacy[5], 34);
+    }
+
+    /// The reply the emulator would send back for a cursor-position query —
+    /// 1-indexed, and read off wherever the chunk that carried the query
+    /// itself left the cursor.
+    #[test]
+    fn dsr_reply_answers_with_the_current_cursor_position() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"hello\r\n\x1b[6n");
+        let reply = dsr_reply(b"hello\r\n\x1b[6n", parser.screen());
+        assert_eq!(reply, Some(b"\x1b[2;1R".to_vec()));
+    }
+
+    /// Ordinary output — the vast majority of what comes through — is not a
+    /// query, and must not be answered as though it were one.
+    #[test]
+    fn dsr_reply_is_none_without_a_query() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"just some output\r\n");
+        assert_eq!(dsr_reply(b"just some output\r\n", parser.screen()), None);
+    }
+
+    #[test]
+    fn da1_is_answered_in_either_spelling() {
+        let reply = Some(b"\x1b[?62;22c".to_vec());
+        assert_eq!(da1_reply(b"\x1b[c"), reply);
+        assert_eq!(da1_reply(b"\x1b[0c"), reply);
+        // Anywhere in the chunk, including after sequences that are not it.
+        assert_eq!(da1_reply(b"\x1b[?2004h\x1b[?u\x1b[c\x1b[6n"), reply);
+    }
+
+    /// The `c` final byte is common and the introducer is everywhere, so this
+    /// is the scanner most able to answer a question nobody asked.
+    #[test]
+    fn da1_reply_is_none_without_a_query() {
+        assert_eq!(da1_reply(b"just some output\r\n"), None);
+        // A terminal's own DA1 response is not a request for one.
+        assert_eq!(da1_reply(b"\x1b[?62;22c"), None);
+        // Neither is any other sequence that happens to end in `c`, nor a `c`
+        // in plain text after an unrelated escape sequence.
+        assert_eq!(da1_reply(b"\x1b[38;5;2mcyan code\x1b[0m"), None);
+        assert_eq!(da1_reply(b"\x1b[2J\x1b[Hcat"), None);
+    }
+
+    /// The startup burst `railway-agent-tui` actually sends, in a single write:
+    /// two mode sets, the kitty query, DA1, then the cursor query. Answering
+    /// the kitty query and not DA1 is what left the pane empty — crossterm
+    /// waits on DA1 as its sentinel — so all three answers have to come back,
+    /// in the order they were asked.
+    #[test]
+    fn the_harness_startup_burst_gets_every_answer() {
+        const BURST: &[u8] = b"\x1b[?2004h\x1b[?1004h\x1b[?u\x1b[c\x1b[6n";
+        let kitty = AtomicBool::new(false);
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(BURST);
+
+        let mut replies = kitty_scan(BURST, &kitty).expect("the kitty query is answered");
+        replies.extend_from_slice(&da1_reply(BURST).expect("DA1 is answered"));
+        replies.extend_from_slice(
+            &dsr_reply(BURST, parser.screen()).expect("the cursor query is answered"),
+        );
+        assert_eq!(replies, b"\x1b[?0u\x1b[?62;22c\x1b[1;1R");
     }
 
     /// An application with mouse reporting on gets the wheel; the emulator's
@@ -1172,24 +1904,5 @@ mod tests {
         let screen = parser.screen();
         assert_eq!(screen.contents().lines().next().unwrap().trim(), "hello");
         assert!(screen.contents().contains("world"));
-    }
-
-    #[test]
-    fn environment_is_read_out_of_a_relay_target() {
-        assert_eq!(
-            environment_from_target("agent:env-123:agent-456"),
-            Some("env-123")
-        );
-    }
-
-    #[test]
-    fn other_target_shapes_are_not_guessed_at() {
-        // A sandbox target has the same arity, and sleeping a machine picked
-        // out of one would suspend the wrong thing entirely.
-        assert_eq!(environment_from_target("sbx:env-123:sandbox-456"), None);
-        assert_eq!(environment_from_target("agent:env-123"), None);
-        assert_eq!(environment_from_target("agent::agent-456"), None);
-        assert_eq!(environment_from_target("agent:env-123:"), None);
-        assert_eq!(environment_from_target("some-service-instance"), None);
     }
 }

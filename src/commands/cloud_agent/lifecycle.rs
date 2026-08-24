@@ -123,9 +123,9 @@ pub struct SshArgs {
     #[clap(long, value_name = "NAME")]
     session: Option<String>,
 
-    /// Leave the agent running on disconnect instead of putting it to sleep.
-    /// A running agent keeps billing for compute
-    #[clap(long)]
+    /// Accepted for compatibility; agents now always stay running on
+    /// disconnect. `railway ca sleep` stops the compute bill
+    #[clap(long, hide = true)]
     keep_awake: bool,
 
     #[clap(flatten)]
@@ -536,27 +536,129 @@ async fn ssh_connect(args: SshArgs) -> Result<i32> {
     let (project, environment) = (args.target.project.clone(), args.target.environment.clone());
 
     let scoped = scope(configs, client, project, environment).await?;
-    let (agent, _) = ca::resolve(configs, client, args.agent.as_deref(), scoped.as_deref()).await?;
     let backboard = configs.get_backboard();
 
-    // Never creates. The caller named a machine — or has exactly one — and
-    // silently minting a second billed VM because a name was mistyped is not a
-    // thing a connect command should be able to do.
+    // A mistyped name still fails — silently minting a second billed VM
+    // because of a typo is not a thing a connect command should be able to
+    // do. But an account with no agents at all has no wrong machine to pick:
+    // asking someone to run `railway ca create` and come back is a hoop, so
+    // the first agent is made here, where setup said new agents live.
+    let resolved =
+        ca::resolve_or_none(configs, client, args.agent.as_deref(), scoped.as_deref()).await?;
+    let (agent, _) = match resolved {
+        Some(found) => found,
+        None => {
+            let home =
+                dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Unable to get home directory"))?;
+            let default =
+                super::prefs::AgentPrefs::load_in(&home).and_then(|prefs| prefs.default_project);
+            // `railway code`'s order exactly (see its `choose_target`): flags,
+            // then the linked directory, then the configured default. Landing
+            // somewhere else than `railway code` would from the same directory
+            // is the inconsistency that order exists to prevent — so the link
+            // is consulted here even though `scope` deliberately does not.
+            let linked = if scoped.is_none() {
+                configs
+                    .get_linked_project()
+                    .await
+                    .ok()
+                    .and_then(|l| l.environment.clone())
+            } else {
+                None
+            };
+            let (environment_id, where_label) = match (&scoped, linked, &default) {
+                (Some(env), _, _) => (env.clone(), "this environment".to_string()),
+                (None, Some(env), _) => (env, "this linked directory's project".to_string()),
+                (None, None, Some(project)) => (
+                    project.environment_id.clone(),
+                    format!("{} ({})", project.project_name, project.environment_name),
+                ),
+                (None, None, None) => bail!(
+                    "You have no cloud agents. Create one with `railway ca create`, \
+                     or set a default project with `railway ca setup`."
+                ),
+            };
+            println!(
+                "{}",
+                format!("No cloud agents yet — creating one in {where_label}.").dimmed()
+            );
+            let agent = ca::create(client, &backboard, &environment_id, None, None).await?;
+            (agent, ca::Resolution::Sole)
+        }
+    };
+
     let was_running = matches!(agent.status, ca::Status::Running);
     let spinner = (!was_running).then(|| create_spinner(format!("Waking agent {}", agent.name)));
-    let ready = ca::ensure_running(client, &backboard, &agent).await;
+    // Probe the route instead of polling status to RUNNING: the platform
+    // routes a shell as soon as the container exists, several seconds before
+    // the status flips. STARTING means something else is already booting the
+    // box, so this waits rather than issuing a second wake.
+    let ready = match agent.status {
+        ca::Status::Running => Ok(()),
+        // relay_access errors flow into `ready` rather than `?`-ing out: the
+        // spinner above is cleared only after this match, and an early return
+        // would leave it animating over the error output.
+        ca::Status::Starting => match code::relay_access().await {
+            Ok(access) => code::wait_until_connectable(
+                client,
+                &backboard,
+                &agent.environment_id,
+                &agent.id,
+                &access,
+                // Caught mid-boot: it may be routable right now.
+                std::time::Duration::ZERO,
+            )
+            .await
+            .map(|_| ()),
+            Err(e) => Err(e),
+        },
+        ca::Status::Sleeping => match ca::wake(client, &backboard, &agent.id).await {
+            Ok(()) => match code::relay_access().await {
+                Ok(access) => code::wait_until_connectable(
+                    client,
+                    &backboard,
+                    &agent.environment_id,
+                    &agent.id,
+                    &access,
+                    // The wake's physical floor; see the wait's doc.
+                    std::time::Duration::from_millis(350),
+                )
+                .await
+                .map(|_| ()),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        },
+        _ => Err(anyhow::anyhow!(
+            "Agent {} is {} — it cannot be connected to. `railway ca delete {}` and create a new one.",
+            agent.name,
+            agent.status.label(),
+            agent.name
+        )),
+    };
     if let Some(spinner) = spinner {
         spinner.finish_and_clear();
     }
-    let agent = ready?;
+    ready?;
     ca::remember(configs, &agent)?;
 
     let connected = if !args.command.is_empty() {
-        telemetry::track_lifecycle("ssh_command", Duration::ZERO, None).await;
+        telemetry::track_lifecycle_detached("ssh_command");
         run_command(&agent, &args.command).await
     } else {
-        attach(client, &backboard, &agent, args.session.as_deref()).await
+        attach(
+            client,
+            &backboard,
+            &agent,
+            args.session.as_deref(),
+            was_running,
+        )
+        .await
     };
+
+    // The user's work is done; let detached telemetry finish before the
+    // process exits (bounded — see drain_detached).
+    crate::commands::ssh::tel::drain_detached(Duration::from_secs(2)).await;
 
     // A connection that never happened still woke a machine with no idle
     // timeout, so put back what this run changed — but only that. An agent
@@ -566,35 +668,22 @@ async fn ssh_connect(args: SshArgs) -> Result<i32> {
     let exit_code = match connected {
         Ok(code) => code,
         Err(e) => {
-            if !was_running && !args.keep_awake {
+            if !was_running {
                 let _ = ca::sleep(client, &backboard, &agent.environment_id, &agent.id).await;
             }
             return Err(e);
         }
     };
 
-    if args.keep_awake {
-        println!(
-            "\nDisconnected — agent {} is still running (--keep-awake).",
-            agent.name.cyan()
-        );
-    } else {
-        // Agents have no idle timeout, so nothing else will ever do this.
-        let spinner = create_spinner("Sleeping the agent".to_string());
-        let slept = ca::sleep(client, &backboard, &agent.environment_id, &agent.id).await;
-        spinner.finish_and_clear();
-        match slept {
-            Ok(()) => println!("\nDisconnected — sleeping agent {}.", agent.name.cyan()),
-            Err(e) => eprintln!(
-                "{}",
-                format!(
-                    "Agent {} is still running and billing compute. `railway ca sleep {}` to stop it. ({e})",
-                    agent.name, agent.name
-                )
-                .yellow()
-            ),
-        }
-    }
+    // Disconnecting no longer sleeps the agent: sleep kills every process on
+    // the VM — including the durable session just detached from — while the
+    // platform keeps listing those sessions as running, so the next reattach
+    // landed on a dead name and a blank screen. Sleeping is deliberate now.
+    println!(
+        "\nDisconnected — agent {} is still running. `railway ca sleep {}` stops the compute bill.",
+        agent.name.cyan(),
+        agent.name
+    );
 
     Ok(exit_code)
 }
@@ -630,9 +719,30 @@ async fn attach(
     backboard: &str,
     agent: &ca::Agent,
     requested: Option<&str>,
+    was_running: bool,
 ) -> Result<i32> {
     let sessions = ca::list_sessions(client, backboard, &agent.id).await?;
-    let running: Vec<_> = sessions.into_iter().filter(|s| s.running).collect();
+    let mut running: Vec<_> = sessions.into_iter().filter(|s| s.running).collect();
+
+    // An agent that was asleep a moment ago cannot have a live session:
+    // sleeping stopped every process on the VM, but the platform's session
+    // records can keep saying "running". Believing them attaches to a dead
+    // name — the relay resolves it, streams nothing, and the screen stays
+    // blank. Skip the zombies and start fresh instead.
+    if !was_running && !running.is_empty() {
+        println!(
+            "{}",
+            format!(
+                "Ignoring {} listed session{} on {} — {} ended when the agent last slept.",
+                running.len(),
+                if running.len() == 1 { "" } else { "s" },
+                agent.name,
+                if running.len() == 1 { "it" } else { "they" },
+            )
+            .dimmed()
+        );
+        running.clear();
+    }
 
     let session_name = match requested {
         Some(name) => {
@@ -647,7 +757,7 @@ async fn attach(
         }
         None => match running.len() {
             0 => {
-                telemetry::track_lifecycle("ssh_new_session", Duration::ZERO, None).await;
+                telemetry::track_lifecycle_detached("ssh_new_session");
                 return start_session(agent).await;
             }
             1 => running[0].name.clone(),
@@ -660,7 +770,7 @@ async fn attach(
         },
     };
 
-    telemetry::track_lifecycle("ssh_attach", Duration::ZERO, None).await;
+    telemetry::track_lifecycle_detached("ssh_attach");
     println!(
         "{}",
         format!("Attaching to {} · {}", agent.name, session_name).dimmed()
@@ -703,7 +813,7 @@ async fn start_session(agent: &ca::Agent) -> Result<i32> {
         format!("No session on {} yet — starting {harness}.", agent.name).dimmed()
     );
     let progress = code::CliProgress::default();
-    let prepared = code::prepare(&launch, &progress).await?;
+    let prepared = code::prepare(&launch, &progress, code::SessionStyle::FullTerminal).await?;
     progress.finish();
 
     let session_name = session::durable_name(prepared.harness);

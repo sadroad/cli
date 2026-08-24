@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::error::ErrorKind;
 
 mod commands;
+mod iac;
 use commands::*;
 use config::Configs;
 use errors::RailwayError;
@@ -287,12 +288,11 @@ async fn main() -> Result<()> {
     // automated CLI users. They are allowed to refresh the update cache and
     // kick off background installs, but we keep staged-binary apply TTY-only
     // so the running binary never changes under a scripted invocation.
-    let auto_applied_version =
-        if auto_update_enabled && is_tty && !is_update_management_cmd && !is_read_only_invocation {
-            util::self_update::try_apply_staged()
-        } else {
-            None
-        };
+    let auto_update_applied = auto_update_enabled
+        && is_tty
+        && !is_update_management_cmd
+        && !is_read_only_invocation
+        && util::self_update::try_apply_staged().is_some();
 
     let update = UpdateCheck::read_normalized();
     let skipped_version = update.skipped_version.clone();
@@ -333,9 +333,10 @@ async fn main() -> Result<()> {
                 )
             {
                 eprintln!(
-                    "{} v{} visit {} for more info",
+                    "{} v{} run {} to update ({} for more info)",
                     "New version available:".green().bold(),
                     latest_version.yellow(),
+                    "railway upgrade".cyan(),
                     "https://docs.railway.com/guides/cli".purple(),
                 );
             }
@@ -366,7 +367,7 @@ async fn main() -> Result<()> {
         }
     } else if !env_or_ci_suppressed && !is_help_or_error && !embedded_setup {
         // Non-TTY counterpart of the banner above, for agent callers only.
-        // Staged-binary apply is TTY-gated (see auto_applied_version), so a
+        // Staged-binary apply is TTY-gated (see auto_update_applied), so a
         // machine whose railway usage is entirely agent-driven would
         // otherwise never apply a downloaded update nor see a reason to —
         // tell the driving agent once per pending version instead. Skipped
@@ -457,10 +458,10 @@ async fn main() -> Result<()> {
     let exec_result = exec_cli(cli).await;
 
     // Send telemetry for silent auto-update apply (after auth is available).
-    if let Some(ref version) = auto_applied_version {
+    if auto_update_applied {
         telemetry::send(telemetry::CliTrackEvent {
             command: "autoupdate_apply".to_string(),
-            sub_command: Some(version.clone()),
+            sub_command: None,
             success: true,
             error_message: None,
             duration_ms: 0,
@@ -489,6 +490,7 @@ async fn main() -> Result<()> {
     }
 
     util::agent_advisory::maybe_show(&raw_args, subcommand_name.as_deref()).await;
+    util::cac_deprecation::maybe_warn(&raw_args, subcommand_name.as_deref());
 
     handle_update_task(check_updates_handle).await;
 
@@ -899,6 +901,10 @@ mod cli_tests {
             assert_parses(&["setup", "agent", "-y"]);
             assert_parses(&["setup", "agent", "--remote"]);
             assert_parses(&["setup", "agent", "--remote", "-y"]);
+            assert_parses(&["setup", "agent", "--local"]);
+            assert_parses(&["setup", "agent", "--local", "-y"]);
+            assert_parses(&["setup", "agent", "--oauth"]);
+            assert_parses(&["setup", "agent", "--oauth", "-y"]);
         }
 
         #[test]
@@ -1042,6 +1048,10 @@ mod cli_tests {
             assert_parses(&["mcp", "install", "--remote"]);
             assert_parses(&["mcp", "install", "--remote", "--agent", "cursor"]);
             assert_parses(&["mcp", "install", "--remote", "--agent", "codex"]);
+            assert_parses(&["mcp", "install", "--local"]);
+            assert_parses(&["mcp", "install", "--local", "--agent", "cursor"]);
+            assert_parses(&["mcp", "install", "--oauth"]);
+            assert_parses(&["mcp", "install", "--oauth", "--agent", "cursor"]);
         }
     }
 }
