@@ -57,6 +57,10 @@
         commonArgs = {
           inherit src;
           pname = "railway";
+          nativeBuildInputs = [
+            pkgs.nodejs
+            pkgs.python3
+          ];
           buildInputs = [
             # Add additional build inputs here
           ]
