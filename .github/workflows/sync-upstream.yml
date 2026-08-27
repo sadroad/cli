@@ -1,0 +1,84 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: Merge, validate, and push upstream
+    if: github.repository == 'sadroad/cli'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required to push the validated upstream merge to this fork.
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Merge Railway upstream
+        id: merge
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/railwayapp/cli.git
+          git fetch --no-tags upstream master
+
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git merge --no-commit --no-ff upstream/master
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Disable non-sync workflows
+        if: steps.merge.outputs.changed == 'true'
+        shell: bash
+        run: |
+          while IFS= read -r -d '' workflow; do
+            disabled="${workflow}.disabled"
+            if [[ -e "$disabled" ]]; then
+              echo "Cannot disable $workflow because $disabled already exists." >&2
+              exit 1
+            fi
+            mv -- "$workflow" "$disabled"
+          done < <(
+            find .github/workflows -maxdepth 1 -type f \
+              \( -name '*.yml' -o -name '*.yaml' \) \
+              ! -name 'sync-upstream.yml' -print0
+          )
+
+      - name: Install Nix
+        if: steps.merge.outputs.changed == 'true'
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+
+      - name: Reconcile Nix lock file
+        if: steps.merge.outputs.changed == 'true'
+        run: nix flake lock
+
+      - name: Verify Nix build
+        if: steps.merge.outputs.changed == 'true'
+        run: nix build .#default --print-build-logs
+
+      - name: Commit and push
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git add --all -- flake.lock .github/workflows
+          git commit -m "chore: sync upstream Railway CLI"
+          gh auth setup-git
+          git push origin HEAD:master

@@ -1,3 +1,4 @@
+# Disabled: only the upstream sync workflow is active in this fork.
 name: Auto Release
 
 on:
