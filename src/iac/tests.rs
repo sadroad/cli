@@ -5,7 +5,7 @@ use super::compiler::{
     CompileOptions, EnvironmentConfigToGraphOptions, environment_config_to_graph,
     graph_to_environment_config, project_definition_to_graph,
 };
-use super::eval::evaluate_file;
+use super::eval::{EvalContext, evaluate_file, evaluate_file_with_context};
 use super::graph::RAILWAY_GRAPH_VERSION;
 use super::partial::IacPartials;
 
@@ -995,6 +995,9 @@ export default () => ({
 
 #[test]
 fn evaluates_python_partial_and_graph() {
+    if which::which("python3").is_err() {
+        return;
+    }
     let dir = tempfile_dir("railway-iac-py-");
     let file = dir.join("railway.py");
     std::fs::write(
@@ -1014,6 +1017,162 @@ def main(ctx=None):
             .resources
             .iter()
             .any(|r| r["address"] == "service.api")
+    );
+}
+
+#[test]
+fn evaluates_go_partial_and_graph() {
+    if which::which("go").is_err() {
+        return;
+    }
+    let dir = tempfile_dir("railway-iac-go-");
+    let file = dir.join("railway.go");
+    std::fs::write(dir.join("go.mod"), "module railway-eval\n\ngo 1.22\n").unwrap();
+    std::fs::write(
+        &file,
+        r#"
+package main
+
+const Partial = "api"
+
+type graph map[string]any
+
+func (g graph) Graph() map[string]any { return g }
+
+func Railway() graph {
+	return graph{
+		"name": "app",
+		"resources": []any{
+			map[string]any{"type": "service", "name": "api", "start": "echo api"},
+		},
+	}
+}
+"#,
+    )
+    .unwrap();
+    let evaluated = evaluate_file(&file).expect("go should evaluate railway.go");
+    assert_eq!(evaluated.partial.as_deref(), Some("api"));
+    assert!(
+        evaluated
+            .graph
+            .resources
+            .iter()
+            .any(|r| r["address"] == "service.api")
+    );
+}
+
+fn eval_context_production() -> EvalContext {
+    EvalContext {
+        command: Some("plan".into()),
+        project_id: Some("proj_123".into()),
+        project_name: Some("acme".into()),
+        environment_id: Some("env_123".into()),
+        environment: Some("production".into()),
+        environment_name: Some("production".into()),
+    }
+}
+
+#[test]
+fn evaluates_typescript_with_cli_context() {
+    let dir = tempfile_dir("railway-iac-ts-ctx-");
+    let file = dir.join("railway.ts");
+    std::fs::write(
+        &file,
+        r#"
+export default (ctx) => ({
+  name: "app",
+  resources: [{
+    address: "service.api",
+    type: "service",
+    name: ctx.isEnvironment("production") ? "prod-api" : "dev-api",
+  }],
+});
+"#,
+    )
+    .unwrap();
+    let evaluated = evaluate_file_with_context(&file, &eval_context_production())
+        .expect("node should evaluate railway.ts with context");
+    assert!(
+        evaluated
+            .graph
+            .resources
+            .iter()
+            .any(|r| r["name"] == "prod-api")
+    );
+}
+
+#[test]
+fn evaluates_python_with_cli_context() {
+    if which::which("python3").is_err() {
+        return;
+    }
+    let dir = tempfile_dir("railway-iac-py-ctx-");
+    let file = dir.join("railway.py");
+    std::fs::write(
+        &file,
+        r#"
+def main(ctx=None):
+    name = "prod-api" if ctx.is_environment("production") else "dev-api"
+    return {"name": "app", "resources": [{"type": "service", "name": name, "start": "echo api"}]}
+"#,
+    )
+    .unwrap();
+    let evaluated = evaluate_file_with_context(&file, &eval_context_production())
+        .expect("python3 should evaluate railway.py with context");
+    assert!(
+        evaluated
+            .graph
+            .resources
+            .iter()
+            .any(|r| r["name"] == "prod-api")
+    );
+}
+
+#[test]
+fn evaluates_go_with_cli_context() {
+    if which::which("go").is_err() {
+        return;
+    }
+    let dir = tempfile_dir("railway-iac-go-ctx-");
+    let file = dir.join("railway.go");
+    std::fs::write(dir.join("go.mod"), "module railway-eval\n\ngo 1.22\n").unwrap();
+    std::fs::write(
+        &file,
+        r#"
+package main
+
+type graph map[string]any
+
+func (g graph) Graph() map[string]any { return g }
+
+type evalCtx struct {
+	Environment     string
+	EnvironmentName string
+}
+
+func Railway(ctx evalCtx) graph {
+	name := "dev-api"
+	if ctx.Environment == "production" {
+		name = "prod-api"
+	}
+	return graph{
+		"name": "app",
+		"resources": []any{
+			map[string]any{"type": "service", "name": name, "start": "echo api"},
+		},
+	}
+}
+"#,
+    )
+    .unwrap();
+    let evaluated = evaluate_file_with_context(&file, &eval_context_production())
+        .expect("go should evaluate railway.go with context");
+    assert!(
+        evaluated
+            .graph
+            .resources
+            .iter()
+            .any(|r| r["name"] == "prod-api")
     );
 }
 

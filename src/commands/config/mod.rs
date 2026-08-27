@@ -90,6 +90,18 @@ struct SharedArgs {
     /// Print variable values in the plan instead of redacting them.
     #[clap(long)]
     show_values: bool,
+
+    /// Write a pinned plan artifact. Plan only.
+    #[clap(long)]
+    out: Option<PathBuf>,
+
+    /// Apply this pinned plan without re-evaluating the authoring file. Apply only.
+    #[clap(long)]
+    plan: Option<PathBuf>,
+
+    /// Tree written into `--out`. Defaults to `git rev-parse HEAD:.railway`.
+    #[clap(long)]
+    source_tree: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -165,6 +177,9 @@ pub async fn command(args: Args) -> Result<()> {
             if args.confirm_destructive {
                 bail!("--confirm-destructive is only valid with `railway config apply`.");
             }
+            if args.plan.is_some() {
+                bail!("--plan is only valid with `railway config apply`.");
+            }
             run_sync(args, false, false).await
         }
         Command::Stage(_args) => bail!(
@@ -173,6 +188,12 @@ pub async fn command(args: Args) -> Result<()> {
         Command::Apply(args) => {
             if args.detailed_exit_code {
                 bail!("--detailed-exit-code is only valid with `railway config plan`.");
+            }
+            if args.out.is_some() {
+                bail!("--out is only valid with `railway config plan`.");
+            }
+            if args.source_tree.is_some() {
+                bail!("--source-tree is only valid with `railway config plan`.");
             }
             run_sync(args, false, true).await
         }
@@ -310,6 +331,7 @@ async fn init_config(args: InitArgs) -> Result<()> {
         )?,
     }
     write_new(&readme_file, &iac_readme(lang), args.force)?;
+    write_language_support_files(lang, &railway_dir)?;
 
     println!("{}", "Railway configuration initialized".green().bold());
     println!(
@@ -360,6 +382,25 @@ fn create_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn write_language_support_files(lang: AuthoringLang, railway_dir: &Path) -> Result<()> {
+    match lang {
+        AuthoringLang::Go => {
+            write_asset_if_missing(
+                &railway_dir.join("go.mod"),
+                "module railway-config\n\ngo 1.22\n\nrequire github.com/railwayapp/railway-go-sdk v0.2.0\n",
+            )?;
+        }
+        AuthoringLang::Python => {
+            write_asset_if_missing(
+                &railway_dir.join("requirements.txt"),
+                "railway-sdk>=0.2.0\n",
+            )?;
+        }
+        AuthoringLang::TypeScript => {}
+    }
+    Ok(())
+}
+
 fn write_asset_if_missing(path: &Path, contents: &str) -> Result<bool> {
     if path.exists() {
         return Ok(false);
@@ -400,6 +441,7 @@ async fn pull_config(args: PullArgs) -> Result<()> {
     )
     .await?;
     let wrote_readme = write_asset_if_missing(&readme_file, &iac_readme(lang))?;
+    write_language_support_files(lang, cwd.join(".railway").as_path())?;
 
     println!("{}", "Railway configuration imported".green().bold());
     println!(
@@ -487,6 +529,9 @@ async fn load_current_graph(runner: Option<String>) -> Result<runner::DesiredGra
         verbose: false,
         detailed_exit_code: false,
         show_values: false,
+        out: None,
+        plan: None,
+        source_tree: None,
     };
     let response = runner::run(&args, "current").await?;
     // `temp_dir` cleans itself up on drop, including on the error paths below.
@@ -776,7 +821,7 @@ fn render_preamble(lang: AuthoringLang, imports: &[&str]) -> String {
             imports.join(", ")
         ),
         AuthoringLang::Python => format!(
-            "from railway_iac import {}\n\n\n@define_railway\ndef main(ctx=None):\n",
+            "from railway_sdk import {}\n\n\n@define_railway\ndef main(ctx=None):\n",
             imports
                 .iter()
                 .map(|name| match *name {
@@ -787,7 +832,7 @@ fn render_preamble(lang: AuthoringLang, imports: &[&str]) -> String {
                 .join(", ")
         ),
         AuthoringLang::Go => {
-            "package main\n\nimport \"github.com/railwayapp/railway-go-iac/iac\"\n\nfunc Railway() iac.Project {\n"
+            "package main\n\nimport \"github.com/railwayapp/railway-go-sdk\"\n\nfunc Railway(ctx railway.Context) railway.Project {\n  ctx = railway.NewContext(ctx)\n"
                 .to_string()
         }
     }
@@ -831,7 +876,7 @@ fn service_call(lang: AuthoringLang, name: &str, body: &str) -> String {
         AuthoringLang::TypeScript => format!("service({name}, {body})"),
         AuthoringLang::Python => format!("service(\n        {name},\n{body}\n    )"),
         AuthoringLang::Go => format!(
-            "{}({name}, iac.ServiceConfig{{\n{body}\n  }})",
+            "{}({name}, railway.ServiceConfig{{\n{body}\n  }})",
             lang.helper("service")
         ),
     }
@@ -1713,7 +1758,9 @@ fn detect_package_manager(cwd: &Path) -> String {
 }
 
 async fn run_sync(args: SharedArgs, stage: bool, apply: bool) -> Result<()> {
-    ensure_config_initialized(&args).await?;
+    if args.plan.is_none() {
+        ensure_config_initialized(&args).await?;
+    }
 
     runner::run_command(runner::Args {
         file: args.file,
@@ -1728,6 +1775,9 @@ async fn run_sync(args: SharedArgs, stage: bool, apply: bool) -> Result<()> {
         verbose: args.verbose,
         detailed_exit_code: args.detailed_exit_code,
         show_values: args.show_values,
+        out: args.out,
+        plan: args.plan,
+        source_tree: args.source_tree,
     })
     .await
 }
@@ -2121,7 +2171,7 @@ mod tests {
         let railway_dir = root.path().join(".railway");
         fs::create_dir_all(&railway_dir).unwrap();
         let py = railway_dir.join("railway.py");
-        fs::write(&py, "from railway_iac import project\n").unwrap();
+        fs::write(&py, "from railway_sdk import project\n").unwrap();
 
         assert_eq!(authoring_file_for_write(root.path()).unwrap(), py);
     }
@@ -2152,7 +2202,7 @@ mod tests {
             )],
         };
         let rendered = render_graph_as_railway(&graph, true, AuthoringLang::Python);
-        assert!(rendered.contains("from railway_iac import"));
+        assert!(rendered.contains("from railway_sdk import"));
         assert!(rendered.contains("def main(ctx=None):"));
         assert!(rendered.contains("source=github(\"org/app\")"));
         assert!(rendered.contains("start=\"./app\""));
@@ -2172,10 +2222,10 @@ mod tests {
             )],
         };
         let rendered = render_graph_as_railway(&graph, true, AuthoringLang::Go);
-        assert!(rendered.contains("github.com/railwayapp/railway-go-iac/iac"));
-        assert!(rendered.contains("func Railway()"));
-        assert!(rendered.contains("iac.Github(\"org/app\")"));
+        assert!(rendered.contains("github.com/railwayapp/railway-go-sdk"));
+        assert!(rendered.contains("func Railway(ctx railway.Context)"));
+        assert!(rendered.contains("railway.Github(\"org/app\")"));
         assert!(rendered.contains("\"start\": \"./app\""));
-        assert!(rendered.contains("iac.ServiceNamed"));
+        assert!(rendered.contains("railway.ServiceNamed"));
     }
 }
