@@ -13,6 +13,19 @@ mod json;
 mod partial;
 pub mod saved_plan;
 
+fn format_resource_variable_reference(namespace: &str, variable: &str) -> String {
+    let namespace = if !namespace.is_empty()
+        && namespace
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        namespace.to_owned()
+    } else {
+        serde_json::Value::String(namespace.to_owned()).to_string()
+    };
+    format!("${{{{{namespace}.{variable}}}}}")
+}
+
 #[allow(dead_code)]
 pub use change_set::{ChangeSet, RAILWAY_CHANGE_SET_VERSION, diff_graphs, render_change_set};
 #[allow(dead_code)]

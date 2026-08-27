@@ -1,5 +1,6 @@
 use serde_json::{Map, Value, json};
 
+use super::format_resource_variable_reference;
 use super::graph::{
     Edge, EnvironmentNode, ProjectNode, RAILWAY_GRAPH_VERSION, RailwayGraph, resource_addr,
     resource_address, resource_name, resource_type,
@@ -504,7 +505,7 @@ fn variable_to_config(value: &Value, resource_names_by_id: &Map<String, Value>) 
                 .and_then(Value::as_str)
                 .unwrap_or(resource);
             let output = field_str(value, "output").unwrap_or("");
-            json!({ "value": format!("${{{{{name}.{output}}}}}") })
+            json!({ "value": format_resource_variable_reference(name, output) })
         }
         _ => value.clone(),
     }

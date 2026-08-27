@@ -6,6 +6,7 @@ use super::compiler::{
     graph_to_environment_config, project_definition_to_graph,
 };
 use super::eval::{EvalContext, evaluate_file, evaluate_file_with_context};
+use super::format_resource_variable_reference;
 use super::graph::RAILWAY_GRAPH_VERSION;
 use super::partial::IacPartials;
 
@@ -221,6 +222,119 @@ fn shared_variable_references_compile() {
         json!({
             "API_KEY": { "value": "${{shared.API_KEY}}" },
             "DASHED": { "value": "${{shared.DASHED-KEY}}" }
+        })
+    );
+}
+
+#[test]
+fn resource_variable_reference_namespaces_are_canonical() {
+    assert_eq!(
+        format_resource_variable_reference("backend", "API_URL"),
+        "${{backend.API_URL}}"
+    );
+    assert_eq!(
+        format_resource_variable_reference("backend-api", "API_URL"),
+        "${{backend-api.API_URL}}"
+    );
+    assert_eq!(
+        format_resource_variable_reference("Main Site", "API_URL"),
+        r#"${{"Main Site".API_URL}}"#
+    );
+    assert_eq!(
+        format_resource_variable_reference("Main \"Site\"", "API_URL"),
+        r#"${{"Main \"Site\"".API_URL}}"#
+    );
+}
+
+#[test]
+fn resource_variable_references_compile_with_quoted_namespaces() {
+    let graph = graph_from(vec![
+        service("Main Site", json!({})),
+        service(
+            "worker",
+            json!({
+                "variables": {
+                    "API_URL": {
+                        "type": "reference",
+                        "resource": "service.Main Site",
+                        "output": "API_URL"
+                    }
+                }
+            }),
+        ),
+    ]);
+    let config = graph_to_environment_config(&graph, &CompileOptions::default());
+    assert_eq!(
+        config["services"]["worker"]["variables"]["API_URL"],
+        json!({ "value": r#"${{"Main Site".API_URL}}"# })
+    );
+}
+
+#[test]
+fn quoted_resource_variable_references_do_not_drift() {
+    let current = graph_from(vec![
+        service("Main Site", json!({})),
+        service(
+            "worker",
+            json!({
+                "variables": {
+                    "API_URL": {
+                        "type": "literal",
+                        "value": r#"${{"Main Site".API_URL}}"#
+                    }
+                }
+            }),
+        ),
+    ]);
+    let desired = graph_from(vec![
+        service("Main Site", json!({})),
+        service(
+            "worker",
+            json!({
+                "variables": {
+                    "API_URL": {
+                        "type": "reference",
+                        "resource": "service.Main Site",
+                        "output": "API_URL"
+                    }
+                }
+            }),
+        ),
+    ]);
+
+    assert!(diff(&current, &desired).changes.is_empty());
+}
+
+#[test]
+fn resource_variable_reference_changes_use_canonical_raw_values() {
+    let current = graph_from(vec![
+        service("Main Site", json!({})),
+        service(
+            "worker",
+            json!({ "variables": { "API_URL": { "type": "preserve" } } }),
+        ),
+    ]);
+    let desired = graph_from(vec![
+        service("Main Site", json!({})),
+        service(
+            "worker",
+            json!({
+                "variables": {
+                    "API_URL": {
+                        "type": "reference",
+                        "resource": "service.Main Site",
+                        "output": "API_URL"
+                    }
+                }
+            }),
+        ),
+    ]);
+
+    assert_eq!(
+        diff(&current, &desired).changes[0]["after"],
+        json!({
+            "type": "raw",
+            "value": { "value": r#"${{"Main Site".API_URL}}"# }
         })
     );
 }

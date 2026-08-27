@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use super::format_resource_variable_reference;
 use super::graph::{RailwayGraph, resource_addr, resource_name, resource_type};
 use super::json::{field, field_str, stable_stringify};
 use super::partial::{
@@ -294,7 +295,7 @@ fn diff_variables(
             "kind": "variable.set",
             "address": resource_addr(resource),
             "variable": key,
-            "after": value,
+            "after": variable_for_change(value, resources_by_address),
             "path": format!("resources.{}.variables.{key}", resource_addr(resource)),
             "summary": format!("{} variable {}.{}", if current.is_some() { "Update" } else { "Set" }, resource_name(resource), key),
             "details": [format!(
@@ -1009,7 +1010,20 @@ fn normalize_variable_for_diff(
         .unwrap_or_else(|| resource.split('.').nth(1).unwrap_or(resource));
     json!({
         "type": "literal",
-        "value": format!("${{{{{}.{}}}}}", name, field_str(value, "output").unwrap_or("")),
+        "value": format_resource_variable_reference(name, field_str(value, "output").unwrap_or("")),
+    })
+}
+
+fn variable_for_change(value: &Value, resources_by_address: &Map<String, Value>) -> Value {
+    if field_str(value, "type") != Some("reference") {
+        return value.clone();
+    }
+    let normalized = normalize_variable_for_diff(Some(value), resources_by_address);
+    json!({
+        "type": "raw",
+        "value": {
+            "value": normalized.get("value").cloned().unwrap_or(Value::Null),
+        },
     })
 }
 
