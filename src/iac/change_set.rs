@@ -345,6 +345,12 @@ fn diff_networking(
     if let Some(obj) = before_copy.as_object_mut() {
         obj.remove("customDomains");
         obj.remove("serviceDomains");
+        if after
+            .and_then(|networking| networking.get("privateNetworkEndpoint"))
+            .is_none()
+        {
+            obj.remove("privateNetworkEndpoint");
+        }
     }
     if let Some(obj) = after_copy.as_object_mut() {
         obj.remove("customDomains");

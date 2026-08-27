@@ -475,6 +475,33 @@ fn template_database_start_command_does_not_churn() {
 }
 
 #[test]
+fn generated_private_network_endpoint_does_not_drift() {
+    let current = graph_from(vec![service(
+        "worker",
+        json!({ "networking": { "privateNetworkEndpoint": "worker" } }),
+    )]);
+    let desired = graph_from(vec![service("worker", json!({}))]);
+
+    assert!(diff(&current, &desired).changes.is_empty());
+}
+
+#[test]
+fn authored_private_network_endpoint_still_diffs() {
+    let current = graph_from(vec![service(
+        "worker",
+        json!({ "networking": { "privateNetworkEndpoint": "worker" } }),
+    )]);
+    let desired = graph_from(vec![service(
+        "worker",
+        json!({ "networking": { "privateNetworkEndpoint": "jobs-worker" } }),
+    )]);
+
+    let changes = diff(&current, &desired).changes;
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["field"], "networking");
+}
+
+#[test]
 fn inline_volume_config_is_hoisted() {
     let graph = project_definition_to_graph(&json!({
         "name": "app",
