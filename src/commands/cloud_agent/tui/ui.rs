@@ -753,27 +753,31 @@ fn render_prompt(app: &App, f: &mut Frame, area: Rect, focused: bool) {
 }
 
 /// How many rows `text` occupies once wrapped at `width`, breaking on spaces
-/// the way ratatui does and hard-wrapping a word that cannot fit.
+/// the way ratatui does, hard-wrapping a word that cannot fit, and starting a
+/// fresh row at every `\n` — the character ⇧enter puts in a draft.
 fn wrapped_lines(text: &str, width: usize) -> usize {
     if width == 0 {
         return 1;
     }
-    let mut rows = 1usize;
-    let mut column = 0usize;
-    for word in text.split_inclusive(' ') {
-        let len = word.chars().count();
-        if column + len > width && column > 0 {
-            rows += 1;
-            column = 0;
-        }
-        if len > width {
-            rows += (len - 1) / width;
-            column = len % width;
-        } else {
-            column += len;
+    let mut rows = 0usize;
+    for line in text.split('\n') {
+        rows += 1;
+        let mut column = 0usize;
+        for word in line.split_inclusive(' ') {
+            let len = word.chars().count();
+            if column + len > width && column > 0 {
+                rows += 1;
+                column = 0;
+            }
+            if len > width {
+                rows += (len - 1) / width;
+                column = len % width;
+            } else {
+                column += len;
+            }
         }
     }
-    rows
+    rows.max(1)
 }
 
 /// The size the session pane will have, given the whole terminal — the same
@@ -820,10 +824,13 @@ fn render_manage(app: &App, f: &mut Frame, rects: &mut PaneRects) {
             .bg(theme.accent)
             .add_modifier(Modifier::BOLD),
     )];
-    if full && !app.sessions.is_empty() {
+    if full && !app.sessions.is_empty() && !app.hide_tabs {
         // Maximized, the tree is folded away, so the open sessions become
-        // tabs on the header: click one (or ⌥[ ⌥]) to switch panes. The
-        // clickable boxes are recorded as they are laid out.
+        // tabs on the header: click one (or ⌥⇧[ ⌥⇧]) to switch panes. The
+        // clickable boxes are recorded as they are laid out. Hidden entirely
+        // by the ⌥s "Full-screen tabs" setting — the rects stay zeroed (a
+        // fresh PaneRects every draw), so there is nothing stale to click —
+        // and the header falls through to the status line instead.
         let mut x = chunks[0].x + " RAILWAY CLOUD-AGENTS ".chars().count() as u16;
         for i in 0..app.sessions.len() {
             // The tab names the session (its task, or its harness-led name),
@@ -1047,7 +1054,7 @@ fn render_manage_footer(app: &App, f: &mut Frame, area: Rect, rects: &PaneRects)
         .selected_agent_status()
         .is_some_and(|status| status != "running");
     let hint: Vec<(&str, &str)> = if app.pane_is_full() {
-        vec![("⌥f", "restore the tree"), ("⌥/⇧esc / ^]", "stop typing")]
+        vec![("⌥f", "restore the tree"), ("⌥⇧esc / ^]", "stop typing")]
     } else if app.focus == ManageFocus::Session {
         // A dead pane's keys are recovery, not typing — the hint has to say
         // so, or "stop typing" advertises an input nothing is reading.
@@ -1061,7 +1068,7 @@ fn render_manage_footer(app: &App, f: &mut Frame, area: Rect, rects: &PaneRects)
                 ("esc", "back to the tree"),
             ]
         } else {
-            let mut keys = vec![("⌥/⇧esc / ^]", "stop typing"), ("⌥f", "maximize")];
+            let mut keys = vec![("⌥⇧esc / ^]", "stop typing"), ("⌥f", "maximize")];
             // The agent is taking the clicks, so say how to take one back — this is
             // the terminal's own convention, but nobody guesses it.
             if app.active_session().is_some_and(|s| s.wants_mouse()) {
@@ -1123,7 +1130,7 @@ fn render_manage_footer(app: &App, f: &mut Frame, area: Rect, rects: &PaneRects)
     // pane the chord is a no-op and the hint would just be a lie.
     let mut hint = hint;
     if app.sessions.len() > 1 {
-        hint.push(("⌥[ ⌥]", "switch session"));
+        hint.push(("⌥⇧[ ⌥⇧]", "switch session"));
     }
     let spans = chord_spans(theme, &hint);
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1504,7 +1511,7 @@ fn render_manage_prompt(app: &App, f: &mut Frame) {
                 if app.shell_selected() {
                     " enter launch · esc close "
                 } else {
-                    " enter send · esc close "
+                    " enter send · ⇧enter newline · esc close "
                 },
                 Style::default().fg(theme.dim),
             ))
@@ -1928,11 +1935,14 @@ fn tree_line(theme: &Theme, row: &Row, tick: usize) -> Line<'static> {
         }
         (RowKind::Session(..), _) => {
             // The marker is the state: a spinner while the attach is in
-            // flight, a filled dot when this UI has it open (and the agent is
-            // green — a sleeping agent's sessions never are), a quiet branch
-            // when it is only running on the agent.
+            // flight or the harness is working, a filled dot when this UI has
+            // it open (and the agent is green — a sleeping agent's sessions
+            // never are), a hollow mark when the harness waits on a human, a
+            // quiet branch otherwise.
             let (glyph, color) = match row.status.as_deref() {
                 Some("connecting") => (format!("{} ", spinner_frame(tick)), theme.pending),
+                Some("working") => (format!("{} ", spinner_frame(tick)), theme.running),
+                Some("waiting") => ("◌ ".to_string(), theme.pending),
                 Some(_) => ("● ".to_string(), theme.running),
                 None => ("↳ ".to_string(), theme.dim),
             };
@@ -2192,10 +2202,35 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
                     session_state(app, &session.name, session.running).to_string(),
                 ));
                 lines.push(kv("kind", session.kind.to_lowercase()));
+                // What the harness inside says it is doing — the full text the
+                // row's label truncates, and the state the row's glyph encodes.
+                if let Some(snapshot) = &session.snapshot {
+                    lines.push(kv("thread", snapshot.state.clone()));
+                    if let Some(text) = snapshot
+                        .latest_prompt
+                        .as_deref()
+                        .or(snapshot.prompt.as_deref())
+                    {
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(vec![
+                            Span::styled(" › ", Style::default().fg(theme.dim)),
+                            Span::styled(truncate(text, 200), Style::default().fg(theme.fg)),
+                        ]));
+                    }
+                    // The agent's own last words, from the daemon transcript —
+                    // only railway-agent threads have one to read.
+                    if let Some(reply) = snapshot.last_reply.as_deref() {
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(Span::styled(
+                            format!(" {}", truncate(reply, 300)),
+                            Style::default().fg(theme.fg),
+                        )));
+                    }
+                }
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     format!(" {}", session.command_summary()),
-                    Style::default().fg(theme.fg),
+                    Style::default().fg(theme.dim),
                 )));
             }
             lines.push(Line::from(""));
@@ -2849,6 +2884,48 @@ mod tests {
         );
     }
 
+    /// The ⌥s "Full-screen tabs" setting takes the header tabs out of the
+    /// maximized layout: ⌥⇧[ ⌥⇧] stay the way between sessions, and the
+    /// zeroed tab rects mean there is nothing stale to click.
+    #[test]
+    fn hidden_tabs_leave_the_maximized_header_bare() {
+        use crate::commands::cloud_agent::tui::session::Session;
+
+        let mut app = app_with_tree();
+        app.screen = Screen::Manage;
+        app.attach_session(
+            Session::for_test("ca_1", "nimble-otter").unwrap(),
+            "ca_1".into(),
+        );
+        app.maximized = true;
+
+        let header = |out: &str| {
+            out.lines()
+                .find(|l| l.contains("RAILWAY CLOUD-AGENTS"))
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        let out = draw(&app, 100, 30);
+        assert!(header(&out).contains(" 1 "), "tabs show by default:\n{out}");
+
+        app.hide_tabs = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut rects = crate::commands::cloud_agent::tui::app::PaneRects::default();
+        terminal
+            .draw(|f| {
+                let (r, _) = render_with_layout(&app, f);
+                rects = r;
+            })
+            .unwrap();
+        let out = draw(&app, 100, 30);
+        assert!(
+            !header(&out).contains(" 1 "),
+            "no tab row when hidden:\n{out}"
+        );
+        assert_eq!(rects.tabs[0].w, 0, "nothing stale to click");
+    }
+
     /// An error toast sits front and center at the bottom of the session
     /// pane, where it can actually be read — not squeezed in beside the
     /// wordmark like a piece of header furniture.
@@ -3355,7 +3432,7 @@ mod tests {
         let out = draw(&app, 100, 34);
         assert!(out.contains("keys"));
         assert!(out.contains("refresh"), "{out}");
-        assert!(out.contains("⌥/⇧esc / ^]"), "{out}");
+        assert!(out.contains("⌥⇧esc / ^]"), "{out}");
         assert!(out.contains("any key closes"));
     }
 
@@ -3375,6 +3452,7 @@ mod tests {
                     running: true,
                     attached: true,
                     created_at: None,
+                    snapshot: None,
                 },
             ]);
         }
@@ -3462,6 +3540,7 @@ mod tests {
                     running: true,
                     attached: false,
                     created_at: None,
+                    snapshot: None,
                 },
             ]);
         }
@@ -3491,6 +3570,7 @@ mod tests {
                     running: true,
                     attached: true,
                     created_at: None,
+                    snapshot: None,
                 },
                 crate::commands::cloud_agent::tui::app::ConsoleSession {
                     name: "claude-two".into(),
@@ -3499,6 +3579,7 @@ mod tests {
                     running: true,
                     attached: false,
                     created_at: None,
+                    snapshot: None,
                 },
             ]);
         }
