@@ -1068,7 +1068,8 @@ fn is_equivalent_database_source(previous: &Value, after: &Value) -> bool {
     if resource_type(previous) != "database" || !after.is_object() {
         return false;
     }
-    field_str(after, "type") == Some("image")
+    field(previous, "source").and_then(|source| field_str(source, "type")) == Some("image")
+        && field_str(after, "type") == Some("image")
         && normalize_image_tag(field_str(after, "image").unwrap_or(""))
             == normalize_image_tag(field_str(previous, "image").unwrap_or(""))
 }

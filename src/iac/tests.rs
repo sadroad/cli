@@ -71,6 +71,45 @@ fn postgres(name: &str, region: Option<&str>) -> Value {
     node
 }
 
+fn repo_postgres(name: &str) -> Value {
+    repo_database(name, "postgres")
+}
+
+fn repo_database(name: &str, engine: &str) -> Value {
+    let (image, output, default_mount_path) = match engine {
+        "mysql" => ("mysql:9", "MYSQL_URL", "/var/lib/mysql"),
+        "redis" => ("railwayapp/redis:8.2", "REDIS_URL", "/bitnami"),
+        "mongo" => ("mongo:8", "MONGO_URL", "/data/db"),
+        _ => (
+            "ghcr.io/railwayapp-templates/postgres-ssl:18",
+            "DATABASE_URL",
+            "/var/lib/postgresql/data",
+        ),
+    };
+    let mut node = json!({
+        "address": format!("database.{name}"),
+        "type": "database",
+        "kind": "database",
+        "engine": engine,
+        "name": name,
+        "image": image,
+        "output": output,
+        "defaultMountPath": default_mount_path,
+    });
+    node["source"] = json!({
+        "type": "github",
+        "repo": "MetaShift-League/msl",
+        "branch": "main",
+        "checkSuites": true,
+    });
+    node["build"] = json!({
+        "builder": "DOCKERFILE",
+        "dockerfilePath": "docker/postgres/Dockerfile",
+        "watchPatterns": ["/docker/postgres/**"],
+    });
+    node
+}
+
 fn redis(name: &str) -> Value {
     json!({
         "address": format!("database.{name}"),
@@ -356,6 +395,131 @@ fn database_region_maps_to_service_and_volume() {
         json!({ "europe-west4": { "numReplicas": 1 } })
     );
     assert_eq!(config["volumes"]["volume-id"]["region"], "europe-west4");
+}
+
+#[test]
+fn database_source_and_build_compile_to_environment_config() {
+    let graph = graph_from(vec![repo_postgres("db")]);
+    let config = graph_to_environment_config(&graph, &CompileOptions::default());
+
+    assert_eq!(
+        config["services"]["db"]["source"],
+        json!({
+            "repo": "MetaShift-League/msl",
+            "branch": "main",
+            "checkSuites": true,
+        })
+    );
+    assert_eq!(
+        config["services"]["db"]["build"],
+        json!({
+            "builder": "DOCKERFILE",
+            "dockerfilePath": "docker/postgres/Dockerfile",
+            "watchPatterns": ["/docker/postgres/**"],
+        })
+    );
+}
+
+#[test]
+fn repo_postgres_source_and_build_round_trip_without_drift() {
+    let desired = graph_from(vec![repo_postgres("db")]);
+    let mut config = graph_to_environment_config(&desired, &CompileOptions::default());
+
+    let current = env_config(config.clone());
+    assert_eq!(current.resources[0]["address"], "database.db");
+    assert_eq!(
+        current.resources[0]["source"],
+        desired.resources[0]["source"]
+    );
+    assert_eq!(current.resources[0]["build"], desired.resources[0]["build"]);
+    assert!(diff(&current, &desired).changes.is_empty());
+
+    let mut masked_config = config.clone();
+    for variable in masked_config["services"]["db"]["variables"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+    {
+        *variable = json!({ "value": "" });
+    }
+    assert_eq!(
+        env_config(masked_config).resources[0]["address"],
+        "database.db"
+    );
+
+    // Railway can retain the original template image after switching the database
+    // to a repository source. The active repository must still win on import.
+    config["services"]["db"]["source"]["image"] =
+        json!("ghcr.io/railwayapp-templates/postgres-ssl:18.6");
+    let current_with_retained_image = env_config(config);
+    assert_eq!(
+        current_with_retained_image.resources[0]["source"],
+        desired.resources[0]["source"]
+    );
+    assert!(
+        diff(&current_with_retained_image, &desired)
+            .changes
+            .is_empty()
+    );
+}
+
+#[test]
+fn repository_database_engines_round_trip_without_type_drift() {
+    for engine in ["postgres", "mysql", "redis", "mongo"] {
+        let desired = graph_from(vec![repo_database("db", engine)]);
+        let config = graph_to_environment_config(&desired, &CompileOptions::default());
+        let current = env_config(config);
+
+        assert_eq!(current.resources[0]["address"], "database.db", "{engine}");
+        assert_eq!(current.resources[0]["engine"], engine, "{engine}");
+        assert_eq!(
+            current.resources[0]["source"],
+            desired.resources[0]["source"]
+        );
+        assert_eq!(current.resources[0]["build"], desired.resources[0]["build"]);
+        assert!(diff(&current, &desired).changes.is_empty(), "{engine}");
+    }
+}
+
+#[test]
+fn repository_database_can_switch_back_to_its_default_image() {
+    let current = graph_from(vec![repo_postgres("db")]);
+    let desired = graph_from(vec![postgres("db", None)]);
+    let changes = diff(&current, &desired).changes;
+
+    assert!(
+        changes.iter().any(|change| change["field"] == "source"),
+        "repo-to-image source change must not be suppressed"
+    );
+}
+
+#[test]
+fn repository_service_with_partial_postgres_signature_stays_a_service() {
+    let desired = graph_from(vec![service(
+        "web",
+        json!({
+            "source": github("MetaShift-League/msl"),
+            "build": {
+                "builder": "DOCKERFILE",
+                "dockerfilePath": "docker/postgres/Dockerfile",
+            },
+            "deploy": { "requiredMountPath": "/var/lib/postgresql/data" },
+            "variables": {
+                "PGDATA": { "type": "literal", "value": "/var/lib/postgresql/data/pgdata" },
+                "POSTGRES_DB": { "type": "literal", "value": "railway" },
+                "DATABASE_URL": { "type": "literal", "value": "postgresql://example" },
+            },
+            "networking": { "tcpProxies": { "5432": {} } },
+        }),
+    )]);
+    let current = env_config(graph_to_environment_config(
+        &desired,
+        &CompileOptions::default(),
+    ));
+
+    assert_eq!(current.resources[0]["address"], "service.web");
+    assert_eq!(current.resources[0]["type"], "service");
+    assert!(diff(&current, &desired).changes.is_empty());
 }
 
 #[test]

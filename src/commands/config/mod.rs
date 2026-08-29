@@ -625,7 +625,7 @@ fn render_graph_as_railway(
             .as_ref()
             .and_then(|source| source.get("image"))
             .is_some()
-            && resource.r#type == "service"
+            && (resource.r#type == "service" || database_source_needs_render(resource))
     }) {
         imports.push("image");
     }
@@ -723,14 +723,10 @@ fn render_graph_as_railway(
                         &call_helper(lang, "service", &[ts_string(&resource.name)]),
                     ));
                 } else {
-                    let mut args = vec![ts_string(&resource.name)];
-                    if let Some(region) = database_region(resource.deploy.as_ref()) {
-                        args.push(region_arg(lang, region));
-                    }
                     out.push_str(&assign_stmt(
                         lang,
                         &var_name,
-                        &call_helper(lang, helper, &args),
+                        &render_database_call(resource, helper, &source_aliases, lang),
                     ));
                     render_database_deploy_overrides(
                         resource.deploy.as_ref(),
@@ -879,14 +875,6 @@ fn list_literal(lang: AuthoringLang, items: &[String]) -> String {
     }
 }
 
-fn region_arg(lang: AuthoringLang, region: &str) -> String {
-    match lang {
-        AuthoringLang::TypeScript => format!("{{ region: {:?} }}", region),
-        AuthoringLang::Python => format!("region={:?}", region),
-        AuthoringLang::Go => format!("map[string]any{{\"region\": {:?}}}", region),
-    }
-}
-
 fn service_call(lang: AuthoringLang, name: &str, body: &str) -> String {
     if body.is_empty() {
         return match lang {
@@ -984,26 +972,10 @@ fn render_service_body(
     lang: AuthoringLang,
 ) -> String {
     let mut lines = Vec::new();
-    if let Some(source) = &resource.source {
-        if source
-            .get("repo")
-            .and_then(|value| value.as_str())
-            .is_some()
-        {
-            let alias = source_aliases
-                .iter()
-                .find_map(|(alias, shared_source)| (shared_source == source).then_some(alias));
-            let value = alias
-                .cloned()
-                .unwrap_or_else(|| render_source(source, lang));
-            lines.push(lang.config_field("source", &value));
-        } else if source
-            .get("image")
-            .and_then(|value| value.as_str())
-            .is_some()
-        {
-            lines.push(lang.config_field("source", &render_source(source, lang)));
-        }
+    if let Some(source) = &resource.source
+        && let Some(value) = render_source_value(source, source_aliases, lang)
+    {
+        lines.push(lang.config_field("source", &value));
     }
     render_build(resource.build.as_ref(), lang, &mut lines);
     render_deploy(
@@ -1033,6 +1005,30 @@ fn render_service_body(
         AuthoringLang::TypeScript => format!("{{\n{}\n  }}", lines.join("\n")),
         AuthoringLang::Python | AuthoringLang::Go => lines.join("\n"),
     }
+}
+
+fn render_source_value(
+    source: &serde_json::Value,
+    source_aliases: &std::collections::BTreeMap<String, serde_json::Value>,
+    lang: AuthoringLang,
+) -> Option<String> {
+    if source
+        .get("repo")
+        .and_then(|value| value.as_str())
+        .is_some()
+    {
+        return Some(
+            source_aliases
+                .iter()
+                .find_map(|(alias, shared_source)| (shared_source == source).then_some(alias))
+                .cloned()
+                .unwrap_or_else(|| render_source(source, lang)),
+        );
+    }
+    source
+        .get("image")
+        .and_then(|value| value.as_str())
+        .map(|_| render_source(source, lang))
 }
 
 fn render_source(source: &serde_json::Value, lang: AuthoringLang) -> String {
@@ -1099,6 +1095,79 @@ fn database_region(deploy: Option<&serde_json::Value>) -> Option<&str> {
         return None;
     }
     regions.keys().next().map(String::as_str)
+}
+
+fn default_database_source(engine: Option<&str>) -> Option<&'static str> {
+    match engine {
+        Some("postgres") => Some("ghcr.io/railwayapp-templates/postgres-ssl:18"),
+        Some("mysql") => Some("mysql:9"),
+        Some("redis") => Some("railwayapp/redis:8.2"),
+        Some("mongo") => Some("mongo:8"),
+        _ => None,
+    }
+}
+
+fn database_source_needs_render(resource: &runner::DesiredResource) -> bool {
+    let Some(source) = resource.source.as_ref() else {
+        return false;
+    };
+    if source
+        .get("repo")
+        .and_then(|value| value.as_str())
+        .is_some()
+    {
+        return true;
+    }
+    let Some(image) = source.get("image").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    let has_options = source.as_object().is_some_and(|source| {
+        source
+            .iter()
+            .any(|(key, value)| !matches!(key.as_str(), "type" | "image") && !value.is_null())
+    });
+    has_options || default_database_source(resource.engine.as_deref()) != Some(image)
+}
+
+fn render_database_call(
+    resource: &runner::DesiredResource,
+    helper: &str,
+    source_aliases: &std::collections::BTreeMap<String, serde_json::Value>,
+    lang: AuthoringLang,
+) -> String {
+    let name = ts_string(&resource.name);
+    let mut lines = Vec::new();
+    if database_source_needs_render(resource)
+        && let Some(source) = resource.source.as_ref()
+        && let Some(value) = render_source_value(source, source_aliases, lang)
+    {
+        lines.push(lang.config_field("source", &value));
+    }
+    render_build(resource.build.as_ref(), lang, &mut lines);
+    if let Some(region) = database_region(resource.deploy.as_ref()) {
+        lines.push(lang.config_field("region", &ts_string(region)));
+    }
+
+    if lines.is_empty() {
+        return call_helper(lang, helper, &[name]);
+    }
+    match lang {
+        AuthoringLang::TypeScript => format!(
+            "{}({name}, {{\n{}\n  }})",
+            lang.helper(helper),
+            lines.join("\n")
+        ),
+        AuthoringLang::Python => format!(
+            "{}(\n        {name},\n{}\n    )",
+            lang.helper(helper),
+            lines.join("\n")
+        ),
+        AuthoringLang::Go => format!(
+            "{}({name}, map[string]any{{\n{}\n\t}})",
+            lang.helper(helper),
+            lines.join("\n")
+        ),
+    }
 }
 
 fn render_database_deploy_overrides(
@@ -2032,6 +2101,41 @@ mod tests {
         }
     }
 
+    fn database_resource(engine: &str) -> runner::DesiredResource {
+        let required_mount_path = match engine {
+            "mysql" => "/var/lib/mysql",
+            "redis" => "/bitnami",
+            "mongo" => "/data/db",
+            _ => "/var/lib/postgresql/data",
+        };
+        runner::DesiredResource {
+            address: Some("database.db".to_string()),
+            r#type: "database".to_string(),
+            name: "db".to_string(),
+            engine: Some(engine.to_string()),
+            variables: None,
+            source: Some(json!({
+                "type": "github",
+                "repo": "MetaShift-League/msl",
+                "branch": "feature/database-image",
+                "checkSuites": true,
+            })),
+            build: Some(json!({
+                "builder": "DOCKERFILE",
+                "dockerfilePath": "docker/postgres/Dockerfile",
+                "watchPatterns": ["/docker/postgres/**"],
+            })),
+            deploy: Some(json!({
+                "multiRegionConfig": { "us-east4-eqdc4a": { "numReplicas": 1 } },
+                "requiredMountPath": required_mount_path,
+            })),
+            networking: None,
+            volume_attachments: None,
+            config: None,
+            group_id: None,
+        }
+    }
+
     #[test]
     fn pull_renderer_preserves_single_region_placement() {
         assert_eq!(
@@ -2166,6 +2270,98 @@ mod tests {
         assert!(rendered.contains("startCommand"));
         assert!(rendered.contains("limitOverride"));
         assert!(!rendered.contains("requiredMountPath"));
+    }
+
+    #[test]
+    fn pull_renderer_preserves_database_source_and_build() {
+        for engine in ["postgres", "mysql", "redis", "mongo"] {
+            let graph = runner::DesiredGraph {
+                project: Some(runner::DesiredProject {
+                    name: "demo".to_string(),
+                }),
+                resources: vec![database_resource(engine)],
+            };
+
+            let rendered = render_graph_as_railway(&graph, true, AuthoringLang::TypeScript);
+
+            assert!(rendered.contains("github"), "{engine}");
+            assert!(
+                rendered.contains(&format!("{engine}(\"db\", {{")),
+                "{engine}"
+            );
+            assert!(
+                rendered.contains("source: github(\"MetaShift-League/msl\""),
+                "{engine}"
+            );
+            assert!(rendered.contains("checkSuites: true"), "{engine}");
+            assert!(rendered.contains("build: {"), "{engine}");
+            assert!(rendered.contains("builder: \"DOCKERFILE\""), "{engine}");
+            assert!(
+                rendered.contains("dockerfilePath: \"docker/postgres/Dockerfile\""),
+                "{engine}"
+            );
+            assert!(
+                rendered.contains("watchPatterns: [\"/docker/postgres/**\"]"),
+                "{engine}"
+            );
+            assert!(rendered.contains("region: \"us-east4-eqdc4a\""), "{engine}");
+        }
+    }
+
+    #[test]
+    fn pulled_database_source_and_build_survive_evaluation() {
+        let root = tempfile::tempdir().unwrap();
+        let railway_dir = root.path().join(".railway");
+        let package_dir = root.path().join("node_modules/railway");
+        fs::create_dir_all(&railway_dir).unwrap();
+        fs::create_dir_all(&package_dir).unwrap();
+        fs::write(
+            package_dir.join("package.json"),
+            r#"{"type":"module","exports":{"./iac":"./iac.js"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            package_dir.join("iac.js"),
+            r#"
+export const defineRailway = (factory) => factory;
+export const project = (name, config = {}) => ({ name, ...config });
+export const service = (name, config = {}) => ({ type: "service", name, ...config });
+export const github = (repo, options = {}) => ({ type: "github", repo, ...options });
+export const postgres = (name, config = {}) => ({
+  address: `database.${name}`,
+  type: "database",
+  kind: "database",
+  engine: "postgres",
+  name,
+  image: "ghcr.io/railwayapp-templates/postgres-ssl:18",
+  output: "DATABASE_URL",
+  defaultMountPath: "/var/lib/postgresql/data",
+  source: config.source,
+  build: config.build,
+});
+"#,
+        )
+        .unwrap();
+        let graph = runner::DesiredGraph {
+            project: Some(runner::DesiredProject {
+                name: "demo".to_string(),
+            }),
+            resources: vec![database_resource("postgres")],
+        };
+        let file = railway_dir.join("railway.ts");
+        fs::write(
+            &file,
+            render_graph_as_railway(&graph, true, AuthoringLang::TypeScript),
+        )
+        .unwrap();
+
+        let evaluated = crate::iac::evaluate_file(&file).unwrap();
+        let database = &evaluated.graph.resources[0];
+        assert_eq!(
+            database["source"],
+            graph.resources[0].source.clone().unwrap()
+        );
+        assert_eq!(database["build"], graph.resources[0].build.clone().unwrap());
     }
 
     #[test]

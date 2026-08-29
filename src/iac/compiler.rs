@@ -315,16 +315,54 @@ fn database_deploy(database: &Value, required_mount_path: &str) -> Value {
     deploy
 }
 
+fn source_to_environment_config(source: Option<&Value>, fallback_image: Option<&Value>) -> Value {
+    let source_type = source.and_then(|source| field_str(source, "type"));
+    let mut config = json!({});
+
+    if source_type == Some("github") {
+        if let Some(repo) = source.and_then(|source| source.get("repo")) {
+            config["repo"] = repo.clone();
+        }
+        if let Some(branch) = source.and_then(|source| source.get("branch")) {
+            config["branch"] = branch.clone();
+        }
+    } else if source_type == Some("image") {
+        if let Some(image) = source.and_then(|source| source.get("image")) {
+            config["image"] = image.clone();
+        }
+    } else if source.is_none()
+        && let Some(image) = fallback_image
+    {
+        config["image"] = image.clone();
+    }
+
+    if let Some(source) = source {
+        for key in [
+            "rootDirectory",
+            "commitSha",
+            "upstreamUrl",
+            "checkSuites",
+            "autoUpdates",
+        ] {
+            if let Some(value) = source.get(key) {
+                config[key] = value.clone();
+            }
+        }
+    }
+
+    prune_empty(config)
+}
+
 fn database_to_environment_config(
     database: &Value,
     is_new: bool,
     volume_id: Option<&str>,
 ) -> Value {
     let engine = field_str(database, "engine").unwrap_or("postgres");
-    let image = field_str(database, "image").unwrap_or("postgres:16");
     if engine != "postgres" {
         let mut config = json!({
-            "source": { "image": image },
+            "source": source_to_environment_config(field(database, "source"), database.get("image")),
+            "build": database.get("build").cloned().unwrap_or(Value::Null),
         });
         if is_new {
             config["isCreated"] = json!(true);
@@ -339,7 +377,8 @@ fn database_to_environment_config(
     }
 
     let mut config = json!({
-        "source": { "image": image },
+        "source": source_to_environment_config(field(database, "source"), database.get("image")),
+        "build": database.get("build").cloned().unwrap_or(Value::Null),
         "deploy": database_deploy(database, "/var/lib/postgresql/data"),
         "variables": {
             "PGDATA": { "value": "/var/lib/postgresql/data/pgdata" },
@@ -367,6 +406,25 @@ fn database_to_environment_config(
     prune_empty(config)
 }
 
+fn database_source_from_environment_config(source: Option<&Value>) -> Value {
+    let Some(source) = source else {
+        return Value::Null;
+    };
+    let mut source = source.clone();
+    let has_repo = source.get("repo").is_some();
+    if let Some(source) = source.as_object_mut() {
+        if has_repo {
+            // A database that originated from a Railway template can retain its old image
+            // alongside the active repository source. The repository is authoritative.
+            source.remove("image");
+            source.insert("type".into(), json!("github"));
+        } else if source.get("image").is_some() {
+            source.insert("type".into(), json!("image"));
+        }
+    }
+    prune_empty(source)
+}
+
 fn service_to_environment_config(
     service: &Value,
     resource_names_by_id: &Map<String, Value>,
@@ -378,34 +436,8 @@ fn service_to_environment_config(
     } else {
         json!({})
     };
-    if let Some(source) = field(service, "source") {
-        let source_type = field_str(source, "type");
-        let mut out = json!({});
-        if source_type == Some("github") {
-            if let Some(repo) = source.get("repo") {
-                out["repo"] = repo.clone();
-            }
-            if let Some(branch) = source.get("branch") {
-                out["branch"] = branch.clone();
-            }
-        }
-        if source_type == Some("image") {
-            if let Some(image) = source.get("image") {
-                out["image"] = image.clone();
-            }
-        }
-        for key in [
-            "rootDirectory",
-            "commitSha",
-            "upstreamUrl",
-            "checkSuites",
-            "autoUpdates",
-        ] {
-            if let Some(value) = source.get(key) {
-                out[key] = value.clone();
-            }
-        }
-        let out = prune_empty(out);
+    if field(service, "source").is_some() {
+        let out = source_to_environment_config(field(service, "source"), None);
         if out.as_object().is_some_and(|obj| !obj.is_empty()) {
             config["source"] = out;
         }
@@ -508,6 +540,77 @@ fn variable_to_config(value: &Value, resource_names_by_id: &Map<String, Value>) 
             json!({ "value": format_resource_variable_reference(name, output) })
         }
         _ => value.clone(),
+    }
+}
+
+fn database_engine_from_image(image: &str) -> Option<&'static str> {
+    let image = image.to_ascii_lowercase();
+    if image.contains("mysql") || image.contains("mariadb") {
+        Some("mysql")
+    } else if image.contains("redis") || image.contains("valkey") {
+        Some("redis")
+    } else if image.contains("mongo") {
+        Some("mongo")
+    } else if image.contains("postgres") || image.contains("postgis") || image.contains("timescale")
+    {
+        Some("postgres")
+    } else {
+        None
+    }
+}
+
+fn default_database_image(engine: &str) -> &'static str {
+    match engine {
+        "mysql" => "mysql:9",
+        "redis" => "railwayapp/redis:8.2",
+        "mongo" => "mongo:8",
+        _ => "ghcr.io/railwayapp-templates/postgres-ssl:18",
+    }
+}
+
+fn has_generated_postgres_signature(service: &Value) -> bool {
+    let variables = [
+        "PGDATA",
+        "PGHOST",
+        "PGPORT",
+        "PGUSER",
+        "PGDATABASE",
+        "PGPASSWORD",
+        "POSTGRES_DB",
+        "DATABASE_URL",
+        "POSTGRES_USER",
+        "SSL_CERT_DAYS",
+        "POSTGRES_PASSWORD",
+        "DATABASE_PUBLIC_URL",
+        "RAILWAY_DEPLOYMENT_DRAINING_SECONDS",
+    ];
+
+    variables.iter().all(|name| {
+        service
+            .get("variables")
+            .and_then(|variables| variables.get(*name))
+            .is_some()
+    }) && service
+        .get("networking")
+        .and_then(|networking| networking.get("tcpProxies"))
+        .and_then(|proxies| proxies.get("5432"))
+        .is_some()
+}
+
+fn repository_database_engine(service: &Value) -> Option<&'static str> {
+    service
+        .get("source")
+        .and_then(|source| source.get("repo"))?;
+    let mount = service
+        .get("deploy")
+        .and_then(|deploy| field_str(deploy, "requiredMountPath"))?;
+
+    match mount {
+        "/var/lib/postgresql/data" if has_generated_postgres_signature(service) => Some("postgres"),
+        "/var/lib/mysql" => Some("mysql"),
+        "/bitnami" => Some("redis"),
+        "/data/db" => Some("mongo"),
+        _ => None,
     }
 }
 
@@ -618,23 +721,11 @@ pub fn environment_config_to_graph(
             let image_name = service
                 .get("source")
                 .and_then(|source| field_str(source, "image"));
-            let looks_like_database = image_name.is_some_and(|image| {
-                image.contains("postgres")
-                    || image.contains("mysql")
-                    || image.contains("redis")
-                    || image.contains("mongo")
-            });
-            if looks_like_database {
-                let image = image_name.unwrap_or("postgres:16");
-                let engine = if image.contains("mysql") {
-                    "mysql"
-                } else if image.contains("redis") {
-                    "redis"
-                } else if image.contains("mongo") {
-                    "mongo"
-                } else {
-                    "postgres"
-                };
+            let database_engine = image_name
+                .and_then(database_engine_from_image)
+                .or_else(|| repository_database_engine(service));
+            if let Some(engine) = database_engine {
+                let image = image_name.unwrap_or_else(|| default_database_image(engine));
                 let output = match engine {
                     "redis" => "REDIS_URL",
                     "mysql" => "MYSQL_URL",
@@ -654,6 +745,8 @@ pub fn environment_config_to_graph(
                     } else {
                         Value::Null
                     },
+                    "source": database_source_from_environment_config(service.get("source")),
+                    "build": service.get("build").cloned().unwrap_or(Value::Null),
                     "deploy": service.get("deploy").cloned().unwrap_or(Value::Null),
                     "volumeMounts": service.get("volumeMounts").cloned().unwrap_or(Value::Null),
                 }));
