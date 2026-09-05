@@ -734,6 +734,12 @@ fn render_graph_as_railway(
                         lang,
                         &mut out,
                     );
+                    render_database_networking_overrides(
+                        resource.networking.as_ref(),
+                        &var_name,
+                        lang,
+                        &mut out,
+                    );
                 }
             }
             "service" => {
@@ -1203,6 +1209,42 @@ fn render_database_deploy_overrides(
         AuthoringLang::Go => out.push_str(&format!(
             "  // deploy overrides: {}\n",
             code_value(&serde_json::Value::Object(overrides), lang)
+        )),
+    }
+}
+
+/// A database's public exposure is authored on the helper result, e.g.
+/// `db.networking = { tcpProxies: { "5432": {} } }`, so a pulled file keeps the
+/// proxy it found and a plan sees the drift when one appears or disappears.
+/// Service domains are platform-generated and stay out of the file.
+fn render_database_networking_overrides(
+    networking: Option<&serde_json::Value>,
+    var_name: &str,
+    lang: AuthoringLang,
+    out: &mut String,
+) {
+    let Some(networking) = networking.and_then(|value| value.as_object()) else {
+        return;
+    };
+    let mut overrides = networking.clone();
+    overrides.remove("serviceDomains");
+    overrides.retain(|_, value| !value.as_object().is_some_and(|map| map.is_empty()));
+    if overrides.is_empty() {
+        return;
+    }
+    let value = serde_json::Value::Object(overrides);
+    match lang {
+        AuthoringLang::TypeScript => out.push_str(&format!(
+            "  {var_name}.networking = {};\n",
+            ts_value(&value)
+        )),
+        AuthoringLang::Python => out.push_str(&format!(
+            "    # networking overrides: {}\n",
+            code_value(&value, lang)
+        )),
+        AuthoringLang::Go => out.push_str(&format!(
+            "  // networking overrides: {}\n",
+            code_value(&value, lang)
         )),
     }
 }
@@ -2113,7 +2155,7 @@ mod tests {
         }
     }
 
-    fn database_resource(engine: &str) -> runner::DesiredResource {
+    fn database_resource_with_source_and_build(engine: &str) -> runner::DesiredResource {
         let required_mount_path = match engine {
             "mysql" => "/var/lib/mysql",
             "redis" => "/bitnami",
@@ -2146,6 +2188,66 @@ mod tests {
             config: None,
             group_id: None,
         }
+    }
+
+    fn database_resource_with_networking(
+        name: &str,
+        engine: &str,
+        networking: Option<serde_json::Value>,
+    ) -> runner::DesiredResource {
+        runner::DesiredResource {
+            address: Some(format!("database.{name}")),
+            r#type: "database".to_string(),
+            name: name.to_string(),
+            engine: Some(engine.to_string()),
+            variables: None,
+            source: None,
+            build: None,
+            deploy: None,
+            networking,
+            volume_attachments: None,
+            config: None,
+            group_id: None,
+        }
+    }
+
+    fn render_database(networking: Option<serde_json::Value>) -> String {
+        let graph = runner::DesiredGraph {
+            project: Some(runner::DesiredProject { name: "app".into() }),
+            resources: vec![database_resource_with_networking(
+                "postgres", "postgres", networking,
+            )],
+        };
+        render_graph_as_railway(&graph, true, AuthoringLang::TypeScript)
+    }
+
+    #[test]
+    fn pull_renderer_authors_a_database_tcp_proxy() {
+        let rendered = render_database(Some(json!({
+            "tcpProxies": { "5432": {} },
+            "serviceDomains": { "postgres.up.railway.app": { "port": 5432 } }
+        })));
+        let helper = rendered
+            .lines()
+            .position(|line| line.contains("= postgres(\"postgres\")"))
+            .expect("database helper call");
+        assert_eq!(
+            rendered.lines().nth(helper + 1).unwrap().trim(),
+            "postgresDatabase.networking = { tcpProxies: { \"5432\": {} } };"
+        );
+        assert!(!rendered.contains("serviceDomains"));
+    }
+
+    #[test]
+    fn pull_renderer_leaves_a_private_database_without_networking() {
+        assert!(!render_database(None).contains(".networking"));
+        assert!(
+            !render_database(Some(json!({
+                "serviceDomains": { "postgres.up.railway.app": { "port": 5432 } }
+            })))
+            .contains(".networking")
+        );
+        assert!(!render_database(Some(json!({ "tcpProxies": {} }))).contains(".networking"));
     }
 
     #[test]
@@ -2291,7 +2393,7 @@ mod tests {
                 project: Some(runner::DesiredProject {
                     name: "demo".to_string(),
                 }),
-                resources: vec![database_resource(engine)],
+                resources: vec![database_resource_with_source_and_build(engine)],
             };
 
             let rendered = render_graph_as_railway(&graph, true, AuthoringLang::TypeScript);
@@ -2358,7 +2460,7 @@ export const postgres = (name, config = {}) => ({
             project: Some(runner::DesiredProject {
                 name: "demo".to_string(),
             }),
-            resources: vec![database_resource("postgres")],
+            resources: vec![database_resource_with_source_and_build("postgres")],
         };
         let file = railway_dir.join("railway.ts");
         fs::write(
